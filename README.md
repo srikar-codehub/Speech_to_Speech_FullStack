@@ -1,70 +1,52 @@
-# Getting Started with Create React App
+# Silero Voice Activity Detection (Browser)
 
-This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
+This React application demonstrates fully in-browser voice activity detection powered by the Silero ONNX model and ONNX Runtime Web. Audio is captured from the user's microphone, downsampled to 16 kHz, and analysed in near-real-time. The UI reports whether the system is currently `Listening...`, has detected active `Speaking...`, or has observed two seconds of continuous silence (`Silence detected.`). After silence the capture stops and restarts automatically.
 
-## Available Scripts
+## Requirements
 
-In the project directory, you can run:
+- Node.js 18+
+- Modern Chromium-based browser (required for SharedArrayBuffer-less audio processing and WebAssembly SIMD support)
+- Microphone permissions granted in the browser
 
-### `npm start`
+## Getting Started
 
-Runs the app in the development mode.\
-Open [http://localhost:3000](http://localhost:3000) to view it in your browser.
+1. Install dependencies:
+   ```bash
+   npm install
+   ```
+2. Start the development server:
+   ```bash
+   npm start
+   ```
+   Open `http://localhost:3000` and click **Start Listening**. Approve microphone access when prompted.
+3. Build for production:
+   ```bash
+   npm run build
+   ```
 
-The page will reload when you make changes.\
-You may also see any lint errors in the console.
+## Implementation Notes
 
-### `npm test`
+- The Silero VAD model (`public/silero_vad.onnx`) and the required ONNX Runtime WASM binaries (`public/onnxruntime/*`) are bundled with the app so that inference never leaves the browser.
+- Audio capture uses the Web Audio API with a `ScriptProcessorNode`, resampling each chunk to 16 kHz before inference.
+- The ONNX Runtime Web session runs on the WASM backend. Each chunk updates an internal state tensor and feeds a ring buffer that tracks 2 seconds of silence before resetting capture.
+- UI and engine logic are separated: React components consume the `useSileroVad` hook, while the engine under `src/vad/` manages audio, preprocessing, inference, and silence detection.
 
-Launches the test runner in the interactive watch mode.\
-See the section about [running tests](https://facebook.github.io/create-react-app/docs/running-tests) for more information.
+## Project Structure
 
-### `npm run build`
+```
+src/
+├─ App.js                 # UI wiring for status updates and controls
+├─ hooks/useSileroVad.js  # Hook exposing engine status, start, and stop
+└─ vad/                   # Engine implementation
+   ├─ Downsampler.js
+   ├─ RingBuffer.js
+   └─ SileroVadEngine.js
+public/
+├─ silero_vad.onnx        # Silero model (copied from silero-realtime-vad package)
+└─ onnxruntime/           # WASM binaries required by onnxruntime-web
+```
 
-Builds the app for production to the `build` folder.\
-It correctly bundles React in production mode and optimizes the build for the best performance.
+## Limitations
 
-The build is minified and the filenames include the hashes.\
-Your app is ready to be deployed!
-
-See the section about [deployment](https://facebook.github.io/create-react-app/docs/deployment) for more information.
-
-### `npm run eject`
-
-**Note: this is a one-way operation. Once you `eject`, you can't go back!**
-
-If you aren't satisfied with the build tool and configuration choices, you can `eject` at any time. This command will remove the single build dependency from your project.
-
-Instead, it will copy all the configuration files and the transitive dependencies (webpack, Babel, ESLint, etc) right into your project so you have full control over them. All of the commands except `eject` will still work, but they will point to the copied scripts so you can tweak them. At this point you're on your own.
-
-You don't have to ever use `eject`. The curated feature set is suitable for small and middle deployments, and you shouldn't feel obligated to use this feature. However we understand that this tool wouldn't be useful if you couldn't customize it when you are ready for it.
-
-## Learn More
-
-You can learn more in the [Create React App documentation](https://facebook.github.io/create-react-app/docs/getting-started).
-
-To learn React, check out the [React documentation](https://reactjs.org/).
-
-### Code Splitting
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/code-splitting](https://facebook.github.io/create-react-app/docs/code-splitting)
-
-### Analyzing the Bundle Size
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size](https://facebook.github.io/create-react-app/docs/analyzing-the-bundle-size)
-
-### Making a Progressive Web App
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app](https://facebook.github.io/create-react-app/docs/making-a-progressive-web-app)
-
-### Advanced Configuration
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/advanced-configuration](https://facebook.github.io/create-react-app/docs/advanced-configuration)
-
-### Deployment
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/deployment](https://facebook.github.io/create-react-app/docs/deployment)
-
-### `npm run build` fails to minify
-
-This section has moved here: [https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify](https://facebook.github.io/create-react-app/docs/troubleshooting#npm-run-build-fails-to-minify)
+- Browser security requires an explicit user interaction before microphone capture can begin.
+- The pipeline avoids async/await in the application code where possible; however, ONNX Runtime Web and getUserMedia rely on underlying asynchronous primitives imposed by browser APIs.

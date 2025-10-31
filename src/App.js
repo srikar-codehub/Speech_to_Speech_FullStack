@@ -1,23 +1,47 @@
-import logo from './logo.svg';
+import { useState } from 'react';
+import useSileroVad from './hooks/useSileroVad';
 import './App.css';
 
 function App() {
+  const { status, start, stop, ready } = useSileroVad();
+  const [capturing, setCapturing] = useState(false);
+
+  const handleStart = () => {
+    if (!ready) {
+      return;
+    }
+    start();
+    setCapturing(true);
+  };
+
+  const handleStop = () => {
+    stop();
+    setCapturing(false);
+  };
+
   return (
-    <div className="App">
-      <header className="App-header">
-        <img src={logo} className="App-logo" alt="logo" />
-        <p>
-          Edit <code>src/App.js</code> and save to reload.
-        </p>
-        <a
-          className="App-link"
-          href="https://reactjs.org"
-          target="_blank"
-          rel="noopener noreferrer"
+    <div className="app-shell">
+      <h1>Silero VAD (ONNX Runtime Web)</h1>
+      <p className="status-label">{status}</p>
+      <div className="actions">
+        <button
+          type="button"
+          onClick={handleStart}
+          disabled={!ready || capturing}
         >
-          Learn React
-        </a>
-      </header>
+          {ready ? 'Start Listening' : 'Loading Model...'}
+        </button>
+        <button
+          type="button"
+          onClick={handleStop}
+          disabled={!capturing}
+        >
+          Stop
+        </button>
+      </div>
+      <p className="note">
+        Allow microphone access when prompted. The detector restarts automatically after silence.
+      </p>
     </div>
   );
 }
