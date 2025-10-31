@@ -31,7 +31,7 @@ function cloneFloat32(source) {
   return copy;
 }
 
-function resolveMediaStream(callback, errorCallback) {
+function resolveMediaStream(constraints, callback, errorCallback) {
   const legacy =
     navigator.mediaDevices && navigator.mediaDevices.getUserMedia
       ? null
@@ -41,13 +41,13 @@ function resolveMediaStream(callback, errorCallback) {
         navigator.msGetUserMedia;
 
   if (legacy) {
-    legacy.call(navigator, { audio: true, video: false }, callback, errorCallback);
+    legacy.call(navigator, constraints, callback, errorCallback);
     return;
   }
 
   if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
     navigator.mediaDevices
-      .getUserMedia({ audio: true, video: false })
+      .getUserMedia(constraints)
       .then(callback)
       .catch(errorCallback);
     return;
@@ -67,6 +67,8 @@ export default function createSileroVadEngine(options) {
     typeof config.onRecordingComplete === 'function' ? config.onRecordingComplete : () => {};
   const silenceDetectedListener =
     typeof config.onSilenceDetected === 'function' ? config.onSilenceDetected : () => {};
+  const deviceErrorListener =
+    typeof config.onDeviceError === 'function' ? config.onDeviceError : () => {};
   const logSilence = config.logSilence !== false;
 
   let silenceDurationSeconds = clamp(
@@ -74,6 +76,8 @@ export default function createSileroVadEngine(options) {
     MIN_SILENCE_SECONDS,
     MAX_SILENCE_SECONDS
   );
+
+  let selectedDeviceId = typeof config.deviceId === 'string' ? config.deviceId : null;
 
   let session = null;
   let audioContext = null;
@@ -173,6 +177,13 @@ export default function createSileroVadEngine(options) {
 
   resetInferenceState();
 
+  function clearProcessingQueues() {
+    chunkQueue = [];
+    pendingResidual = new Float32Array(0);
+    silenceRing.clear();
+    speaking = false;
+  }
+
   function finalizeSilenceDetection() {
     if (processingSilence) {
       return;
@@ -197,13 +208,6 @@ export default function createSileroVadEngine(options) {
     resetRecording();
 
     processingSilence = false;
-  }
-
-  function clearProcessingQueues() {
-    chunkQueue = [];
-    pendingResidual = new Float32Array(0);
-    silenceRing.clear();
-    speaking = false;
   }
 
   function prepareInput(chunk) {
@@ -367,23 +371,46 @@ export default function createSileroVadEngine(options) {
     pendingCapture = true;
     resetInferenceState();
 
-    resolveMediaStream(
-      (stream) => {
-        pendingCapture = false;
-        if (disposed || !active) {
-          stream.getTracks().forEach((track) => track.stop());
-          return;
-        }
-        console.info('[SileroVAD] Microphone access granted');
-        streamRef = stream;
-        attachProcessor(stream);
-      },
-      (error) => {
-        pendingCapture = false;
-        console.error('[SileroVAD] Unable to access microphone', error);
-        setStatus('Microphone access denied');
+    const constraints = selectedDeviceId
+      ? { audio: { deviceId: { exact: selectedDeviceId } }, video: false }
+      : { audio: true, video: false };
+
+    const handleStream = (stream) => {
+      pendingCapture = false;
+      if (disposed || !active) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
       }
-    );
+      console.info('[SileroVAD] Microphone access granted');
+      streamRef = stream;
+      attachProcessor(stream);
+    };
+
+    const handleError = (error) => {
+      pendingCapture = false;
+      if (selectedDeviceId) {
+        console.warn(
+          `[SileroVAD] Requested device ${selectedDeviceId} unavailable. Falling back to default.`,
+          error
+        );
+        try {
+          deviceErrorListener({
+            type: 'unavailable',
+            deviceId: selectedDeviceId,
+            error,
+          });
+        } catch (callbackError) {
+          console.warn('[SileroVAD] Device error listener threw', callbackError);
+        }
+        selectedDeviceId = null;
+        requestCapture();
+        return;
+      }
+      console.error('[SileroVAD] Unable to access microphone', error);
+      setStatus('Microphone access denied');
+    };
+
+    resolveMediaStream(constraints, handleStream, handleError);
   }
 
   function configureOrt() {
@@ -503,6 +530,21 @@ export default function createSileroVadEngine(options) {
     setSilenceDuration(seconds) {
       updateSilenceDuration(seconds);
       silenceRing.clear();
+    },
+    setDevice(deviceId) {
+      const nextId = typeof deviceId === 'string' && deviceId.length > 0 ? deviceId : null;
+      if (selectedDeviceId === nextId) {
+        return;
+      }
+      selectedDeviceId = nextId;
+      if (active) {
+        setEngineState(ENGINE_STATES.LISTENING, 'Switching microphone...');
+        releaseAudioResources();
+        clearProcessingQueues();
+        resetRecording();
+        resetInferenceState();
+        requestCapture();
+      }
     },
     isActive() {
       return active;

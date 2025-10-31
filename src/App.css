@@ -138,6 +138,18 @@
   box-shadow: 0 4px 12px rgba(1, 4, 9, 0.25);
 }
 
+.mic-control-card {
+  min-width: 220px;
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 10px;
+  padding: 0.85rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  box-shadow: 0 4px 12px rgba(1, 4, 9, 0.25);
+}
+
 .silence-control-label {
   font-size: 0.85rem;
   font-weight: 600;
@@ -175,6 +187,34 @@
   width: 4.5rem;
   text-align: center;
   font-weight: 600;
+}
+
+.mic-control-label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.mic-control-select {
+  width: 100%;
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  color: #f0f6fc;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.9rem;
+  transition: border-color 0.2s ease;
+}
+
+.mic-control-select:focus {
+  outline: none;
+  border-color: #58a6ff;
+}
+
+.mic-control-select:disabled {
+  opacity: 0.5;
 }
 
 .silence-control-value {

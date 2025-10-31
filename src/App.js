@@ -5,6 +5,7 @@ import useSileroVad, {
 } from './hooks/useSileroVad';
 import VadStatusIndicator from './components/VadStatusIndicator';
 import SilenceDurationControl from './components/SilenceDurationControl';
+import MicrophoneSelector from './components/MicrophoneSelector';
 import SelectControl from './components/SelectControl';
 import PipelineLogger from './components/PipelineLogger';
 import './App.css';
@@ -27,6 +28,9 @@ function App() {
     setNeuralVoice,
     logs,
     clearLogs,
+    devices,
+    selectedDeviceId,
+    setSelectedDeviceId,
   } = useSileroVad();
 
   const handleStart = () => {
@@ -60,6 +64,13 @@ function App() {
             step={0.5}
             onChange={setSilenceDuration}
             disabled={!ready}
+          />
+          <MicrophoneSelector
+            devices={devices}
+            value={selectedDeviceId}
+            onChange={setSelectedDeviceId}
+            disabled={!ready}
+            id="microphone-select"
           />
         </div>
         <div className="select-grid">

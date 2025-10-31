@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import createSileroVadEngine, { ENGINE_STATES } from '../vad/SileroVadEngine';
 import sendAudioToBackend from '../utils/backend';
 
@@ -30,8 +30,9 @@ const DEFAULT_SILENCE_SECONDS = 2;
 const MIN_SILENCE_SECONDS = 0.5;
 const MAX_SILENCE_SECONDS = 5;
 const TARGET_SAMPLE_RATE = 16000;
+const DEFAULT_DEVICE_ID = 'default';
 
-const LOG_TYPES = {
+export const LOG_TYPES = {
   INFO: 'info',
   SUCCESS: 'success',
   WARNING: 'warning',
@@ -43,6 +44,7 @@ export default function useSileroVad() {
   const handleRecordingRef = useRef(() => {});
   const handleStateChangeRef = useRef(() => {});
   const silenceDurationRef = useRef(DEFAULT_SILENCE_SECONDS);
+  const enumeratedAfterPermissionRef = useRef(false);
 
   const [status, setStatus] = useState('Loading model...');
   const [ready, setReady] = useState(false);
@@ -55,6 +57,8 @@ export default function useSileroVad() {
   const [targetLanguage, setTargetLanguage] = useState(LANGUAGE_OPTIONS[1]);
   const [neuralVoice, setNeuralVoice] = useState(VOICE_OPTIONS[0]);
   const [logs, setLogs] = useState([]);
+  const [devices, setDevices] = useState([{ deviceId: DEFAULT_DEVICE_ID, label: 'System Default' }]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState(DEFAULT_DEVICE_ID);
 
   const shouldContinueRef = useRef(false);
   const playbackRef = useRef({ context: null, source: null, resolve: null });
@@ -124,9 +128,8 @@ export default function useSileroVad() {
         try {
           const context = new AudioContextCtor();
           const buffer = context.createBuffer(1, audioData.length, TARGET_SAMPLE_RATE);
-          buffer.copyToChannel
-            ? buffer.copyToChannel(audioData, 0)
-            : buffer.getChannelData(0).set(audioData);
+          const targetChannel = buffer.getChannelData(0);
+          targetChannel.set(audioData);
 
           const source = context.createBufferSource();
           source.buffer = buffer;
@@ -156,6 +159,63 @@ export default function useSileroVad() {
     [stopPlayback]
   );
 
+  const enumerateAudioDevices = useCallback(async () => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
+      addLog('[DEVICE] Media device enumeration is not supported in this browser.', LOG_TYPES.WARNING);
+      return;
+    }
+    try {
+      const deviceList = await navigator.mediaDevices.enumerateDevices();
+      const audioInputs = deviceList.filter((device) => device.kind === 'audioinput');
+
+      let unnamedIndex = 1;
+      let defaultLabel = 'System Default';
+      const concreteDevices = [];
+
+      audioInputs.forEach((device, index) => {
+        const deviceId = device.deviceId || `device-${index}`;
+        const label = device.label && device.label.trim().length > 0
+          ? device.label
+          : `Microphone ${unnamedIndex++}`;
+
+        if (deviceId === 'default') {
+          defaultLabel = label;
+        } else {
+          concreteDevices.push({ deviceId, label });
+        }
+      });
+
+      concreteDevices.sort((a, b) => a.label.localeCompare(b.label));
+
+      const nextDevices = [
+        { deviceId: DEFAULT_DEVICE_ID, label: defaultLabel || 'System Default' },
+        ...concreteDevices,
+      ];
+
+      setDevices(nextDevices);
+      addLog(
+        `[DEVICE] Found ${audioInputs.length} audio input device(s).`,
+        LOG_TYPES.INFO
+      );
+
+      const stillValid = nextDevices.some((device) => device.deviceId === selectedDeviceId);
+      if (!stillValid) {
+        if (selectedDeviceId !== DEFAULT_DEVICE_ID) {
+          addLog(
+            '[DEVICE] Previous microphone is no longer available. Reverting to default microphone.',
+            LOG_TYPES.WARNING
+          );
+        }
+        setSelectedDeviceId(DEFAULT_DEVICE_ID);
+      }
+    } catch (error) {
+      addLog(
+        `[DEVICE] Unable to enumerate audio devices: ${error.message || error}`,
+        LOG_TYPES.WARNING
+      );
+    }
+  }, [addLog, selectedDeviceId]);
+
   const runPipeline = useCallback(
     async (audioData) => {
       if (processingRef.current) {
@@ -174,40 +234,32 @@ export default function useSileroVad() {
 
         setPipelineState(PIPELINE_STATES.SENDING_TO_BACKEND);
         setStatus('Preparing payload for backend...');
-        addLog('📤 PREPARING BACKEND PAYLOAD: Encoding audio data...', LOG_TYPES.INFO);
+        addLog('[PIPELINE] Preparing backend payload.', LOG_TYPES.INFO);
         const payload = sendAudioToBackend(audioData, {
-          sourceLanguage,
-          targetLanguage,
-          neuralVoice,
-        });
-        console.log('[Pipeline] Current configuration:', {
           sourceLanguage,
           targetLanguage,
           neuralVoice,
         });
         setLastPayload(payload);
 
-        const audioDataString =
-          payload && typeof payload.audio_data === 'string' ? payload.audio_data : '';
+        const audioString = payload && typeof payload.audio_data === 'string' ? payload.audio_data : '';
         const maxPreviewLength = 50;
-        let truncatedAudio = '';
+        let truncated = '';
         let byteEstimate = 0;
-        if (audioDataString) {
-          truncatedAudio =
-            audioDataString.length > maxPreviewLength
-              ? `${audioDataString.slice(0, maxPreviewLength)}...`
-              : audioDataString;
-          byteEstimate = Math.round((audioDataString.length * 3) / 4);
+        if (audioString) {
+          truncated =
+            audioString.length > maxPreviewLength
+              ? `${audioString.slice(0, maxPreviewLength)}...`
+              : audioString;
+          byteEstimate = Math.round((audioString.length * 3) / 4);
         }
 
         const payloadForLog = {
           ...payload,
-          audio_data: audioDataString
-            ? `${truncatedAudio} (${byteEstimate} bytes)`
-            : '(no audio data)',
+          audio_data: audioString ? `${truncated} (${byteEstimate} bytes)` : '(no audio data)',
         };
         addLog(
-          `📋 JSON GENERATED:\n${JSON.stringify(payloadForLog, null, 2)}`,
+          `[PIPELINE] JSON payload generated:\n${JSON.stringify(payloadForLog, null, 2)}`,
           LOG_TYPES.INFO
         );
 
@@ -218,9 +270,9 @@ export default function useSileroVad() {
 
         setPipelineState(PIPELINE_STATES.PLAYING_AUDIO);
         setStatus('Playing recorded audio...');
-        addLog('🔊 PLAYBACK: Playing recorded audio...', LOG_TYPES.INFO);
+        addLog('[PIPELINE] Playback starting.', LOG_TYPES.INFO);
         await playAudioData(audioData);
-        addLog('✅ PLAYBACK COMPLETE', LOG_TYPES.SUCCESS);
+        addLog('[PIPELINE] Playback complete.', LOG_TYPES.SUCCESS);
 
         if (!shouldContinueRef.current) {
           setStatus('Idle.');
@@ -228,7 +280,7 @@ export default function useSileroVad() {
           return;
         }
 
-        addLog('🔄 AUTO-RESTART: Starting listening again...', LOG_TYPES.INFO);
+        addLog('[PIPELINE] Auto-restart: listening again.', LOG_TYPES.INFO);
         setPipelineState(PIPELINE_STATES.LISTENING);
         setStatus('Listening...');
 
@@ -242,7 +294,7 @@ export default function useSileroVad() {
         stopPlayback({ invokeResolve: true });
         shouldContinueRef.current = false;
         setIsActive(false);
-        addLog(`⚠️ PIPELINE ERROR: ${error.message || String(error)}`, LOG_TYPES.WARNING);
+        addLog(`[ERROR] Pipeline error: ${error.message || String(error)}`, LOG_TYPES.WARNING);
       } finally {
         processingRef.current = false;
       }
@@ -280,24 +332,53 @@ export default function useSileroVad() {
         return;
       }
 
+      if (!enumeratedAfterPermissionRef.current) {
+        enumerateAudioDevices();
+        enumeratedAfterPermissionRef.current = true;
+      }
+
       runPipeline(audioData);
     },
-    [ready, runPipeline]
+    [enumerateAudioDevices, ready, runPipeline]
   );
 
   const handleStateChange = useCallback(
     (nextState) => {
       if (nextState === ENGINE_STATES.LISTENING && shouldContinueRef.current) {
         setPipelineState(PIPELINE_STATES.LISTENING);
-        addLog('🎤 LISTENING: Recording audio...', LOG_TYPES.INFO);
+        addLog('[STATE] Listening for speech.', LOG_TYPES.INFO);
       } else if (nextState === ENGINE_STATES.RECORDING) {
         setPipelineState(PIPELINE_STATES.RECORDING);
-        addLog('🔊 SPEAKING: Voice detected', LOG_TYPES.INFO);
+        addLog('[STATE] Speech detected.', LOG_TYPES.INFO);
       } else if (nextState === ENGINE_STATES.SILENCE_DETECTED) {
         setPipelineState(PIPELINE_STATES.SILENCE_DETECTED);
       } else if (nextState === ENGINE_STATES.IDLE && !shouldContinueRef.current) {
         setPipelineState(PIPELINE_STATES.IDLE);
       }
+    },
+    [addLog]
+  );
+
+  const handleSilenceDetected = useCallback(
+    (detectedDuration) => {
+      const duration =
+        typeof detectedDuration === 'number' ? detectedDuration : silenceDurationRef.current;
+      silenceDurationRef.current = duration;
+      addLog(
+        `[STATE] Silence detected after ${duration.toFixed(1)} second(s).`,
+        LOG_TYPES.WARNING
+      );
+    },
+    [addLog]
+  );
+
+  const handleDeviceError = useCallback(
+    (info) => {
+      const attemptedId = info && info.deviceId ? info.deviceId : 'requested device';
+      addLog(
+        `[DEVICE] Requested microphone (${attemptedId}) is unavailable. Falling back to default microphone.`,
+        LOG_TYPES.WARNING
+      );
     },
     [addLog]
   );
@@ -316,15 +397,8 @@ export default function useSileroVad() {
       onStatusChange: setStatus,
       onStateChange: (state) => handleStateChangeRef.current(state),
       onRecordingComplete: (audioData) => handleRecordingRef.current(audioData),
-      onSilenceDetected: (detectedDuration) => {
-        const duration =
-          typeof detectedDuration === 'number' ? detectedDuration : silenceDurationRef.current;
-        silenceDurationRef.current = duration;
-        addLog(
-          `🔇 SILENCE DETECTED: After ${duration.toFixed(1)}s of silence`,
-          LOG_TYPES.WARNING
-        );
-      },
+      onSilenceDetected: handleSilenceDetected,
+      onDeviceError: handleDeviceError,
     });
     engineRef.current = engine;
 
@@ -337,7 +411,7 @@ export default function useSileroVad() {
           setReady(true);
           setStatus('Ready. Press Start to begin.');
           setPipelineState(PIPELINE_STATES.IDLE);
-          addLog('✅ Model ready. Awaiting Start command.', LOG_TYPES.SUCCESS);
+          addLog('[INIT] Model ready. Awaiting start.', LOG_TYPES.SUCCESS);
         }
       })
       .catch((error) => {
@@ -345,6 +419,7 @@ export default function useSileroVad() {
         if (!cancelled) {
           const reason = error && error.message ? error.message : String(error);
           setStatus(`Initialization failed: ${reason}`);
+          addLog(`[ERROR] Initialization failed: ${reason}`, LOG_TYPES.WARNING);
         }
       });
 
@@ -358,7 +433,27 @@ export default function useSileroVad() {
         engineRef.current = null;
       }
     };
-  }, [addLog, stopPlayback]);
+  }, [addLog, handleDeviceError, handleSilenceDetected, stopPlayback]);
+
+  useEffect(() => {
+    if (!navigator.mediaDevices) {
+      return undefined;
+    }
+
+    enumerateAudioDevices();
+
+    if (!navigator.mediaDevices.addEventListener) {
+      return undefined;
+    }
+
+    const handleChange = () => {
+      enumerateAudioDevices();
+    };
+    navigator.mediaDevices.addEventListener('devicechange', handleChange);
+    return () => {
+      navigator.mediaDevices.removeEventListener('devicechange', handleChange);
+    };
+  }, [enumerateAudioDevices]);
 
   const updateSilenceDuration = useCallback((value) => {
     const numericValue = Number(value);
@@ -380,9 +475,15 @@ export default function useSileroVad() {
     setIsActive(true);
     setPipelineState(PIPELINE_STATES.LISTENING);
     setStatus('Preparing microphone...');
-    addLog('▶ START: User clicked Start button', LOG_TYPES.INFO);
+    addLog('[CONTROL] Start button clicked.', LOG_TYPES.INFO);
+    engineRef.current.setDevice(
+      selectedDeviceId === DEFAULT_DEVICE_ID ? null : selectedDeviceId
+    );
     engineRef.current.start();
-  }, [addLog, ready]);
+    setTimeout(() => {
+      enumerateAudioDevices();
+    }, 500);
+  }, [addLog, enumerateAudioDevices, ready, selectedDeviceId]);
 
   const stop = useCallback(() => {
     shouldContinueRef.current = false;
@@ -394,12 +495,36 @@ export default function useSileroVad() {
     setIsActive(false);
     setPipelineState(PIPELINE_STATES.IDLE);
     setStatus('Idle.');
-    addLog('⏹ STOP: User clicked Stop button', LOG_TYPES.WARNING);
+    addLog('[CONTROL] Stop button clicked.', LOG_TYPES.WARNING);
   }, [addLog, stopPlayback]);
 
   useEffect(() => {
     silenceDurationRef.current = silenceDuration;
   }, [silenceDuration]);
+
+  const handleDeviceSelection = useCallback(
+    (deviceId) => {
+      const normalizedId = deviceId || DEFAULT_DEVICE_ID;
+      setSelectedDeviceId(normalizedId);
+
+      const deviceLabel =
+        devices.find((device) => device.deviceId === normalizedId)?.label || 'System Default';
+
+      addLog(`[DEVICE] Device changed: now using ${deviceLabel}.`, LOG_TYPES.INFO);
+
+      if (engineRef.current) {
+        engineRef.current.setDevice(normalizedId === DEFAULT_DEVICE_ID ? null : normalizedId);
+        if (shouldContinueRef.current) {
+          addLog('[DEVICE] Restarting capture with the selected microphone.', LOG_TYPES.INFO);
+        }
+      }
+    },
+    [addLog, devices]
+  );
+
+  const selectedDeviceLabel = useMemo(() => {
+    return devices.find((device) => device.deviceId === selectedDeviceId)?.label || 'System Default';
+  }, [devices, selectedDeviceId]);
 
   return {
     status,
@@ -420,5 +545,9 @@ export default function useSileroVad() {
     setNeuralVoice,
     logs,
     clearLogs,
+    devices,
+    selectedDeviceId,
+    setSelectedDeviceId: handleDeviceSelection,
+    selectedDeviceLabel,
   };
 }
