@@ -31,6 +31,10 @@ function App() {
     devices,
     selectedDeviceId,
     setSelectedDeviceId,
+    backendUrl,
+    setBackendUrl,
+    showFullRequest,
+    setShowFullRequest,
   } = useSileroVad();
 
   const handleStart = () => {
@@ -65,13 +69,37 @@ function App() {
             onChange={setSilenceDuration}
             disabled={!ready}
           />
-          <MicrophoneSelector
-            devices={devices}
-            value={selectedDeviceId}
-            onChange={setSelectedDeviceId}
-            disabled={!ready}
-            id="microphone-select"
+        <MicrophoneSelector
+          devices={devices}
+          value={selectedDeviceId}
+          onChange={setSelectedDeviceId}
+          disabled={!ready}
+          id="microphone-select"
+        />
+        <div className="backend-control-card">
+          <label className="backend-control-label" htmlFor="backend-url-input">
+            Backend URL:
+          </label>
+          <input
+            id="backend-url-input"
+            type="text"
+            className="backend-control-input"
+            value={backendUrl}
+            onChange={(event) => setBackendUrl(event.target.value)}
+            placeholder="https://your-backend"
           />
+        </div>
+        <div className="backend-debug-card">
+          <label className="backend-debug-toggle" htmlFor="backend-debug-checkbox">
+            <input
+              id="backend-debug-checkbox"
+              type="checkbox"
+              checked={showFullRequest}
+              onChange={(event) => setShowFullRequest(event.target.checked)}
+            />
+            Show Full Request
+          </label>
+        </div>
         </div>
         <div className="select-grid">
           <SelectControl

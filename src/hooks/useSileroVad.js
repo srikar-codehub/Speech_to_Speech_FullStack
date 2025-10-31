@@ -29,7 +29,6 @@ export const VOICE_OPTIONS = ['Female Voice 1', 'Male Voice 1', 'Female Voice 2'
 const DEFAULT_SILENCE_SECONDS = 2;
 const MIN_SILENCE_SECONDS = 0.5;
 const MAX_SILENCE_SECONDS = 5;
-const TARGET_SAMPLE_RATE = 16000;
 const DEFAULT_DEVICE_ID = 'default';
 
 export const LOG_TYPES = {
@@ -59,21 +58,25 @@ export default function useSileroVad() {
   const [logs, setLogs] = useState([]);
   const [devices, setDevices] = useState([{ deviceId: DEFAULT_DEVICE_ID, label: 'System Default' }]);
   const [selectedDeviceId, setSelectedDeviceId] = useState(DEFAULT_DEVICE_ID);
+  const [backendUrl, setBackendUrl] = useState('http://localhost:7071');
+  const [showFullRequest, setShowFullRequest] = useState(false);
 
   const shouldContinueRef = useRef(false);
   const playbackRef = useRef({ context: null, source: null, resolve: null });
   const processingRef = useRef(false);
 
   const addLog = useCallback((message, type = LOG_TYPES.INFO) => {
-    setLogs((prev) => {
+    setLogs((previous) => {
       const now = new Date();
-      const entry = {
-        id: `${now.getTime()}-${Math.random().toString(16).slice(2, 8)}`,
-        time: now.toLocaleTimeString([], { hour12: false }),
-        message,
-        type,
-      };
-      return [...prev, entry];
+      return [
+        ...previous,
+        {
+          id: `${now.getTime()}-${Math.random().toString(16).slice(2, 8)}`,
+          time: now.toLocaleTimeString([], { hour12: false }),
+          message,
+          type,
+        },
+      ];
     });
   }, []);
 
@@ -92,76 +95,92 @@ export default function useSileroVad() {
       try {
         playback.source.stop();
       } catch (error) {
-        // Ignore stop errors
+        // ignore
       }
       try {
         playback.source.disconnect();
       } catch (error) {
-        // Ignore disconnect errors
+        // ignore
       }
     }
     if (playback.context) {
       playback.context.close().catch(() => {});
     }
     if (invokeResolve && playback.resolve) {
-      playback.resolve();
+      try {
+        playback.resolve();
+      } catch (resolveError) {
+        console.warn('Playback resolve failed', resolveError);
+      }
     }
     playbackRef.current = { context: null, source: null, resolve: null };
   }, []);
 
-  const playAudioData = useCallback(
-    (audioData) =>
-      new Promise((resolve, reject) => {
-        if (!audioData || audioData.length === 0) {
-          resolve();
-          return;
-        }
+  const playAudioBuffer = useCallback((audioContext, audioBuffer) => {
+    return new Promise((resolve, reject) => {
+      try {
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(audioContext.destination);
 
-        stopPlayback();
+        playbackRef.current = { context: audioContext, source, resolve };
 
-        const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
-        if (!AudioContextCtor) {
-          reject(new Error('Web Audio API not supported'));
-          return;
-        }
-
-        try {
-          const context = new AudioContextCtor();
-          const buffer = context.createBuffer(1, audioData.length, TARGET_SAMPLE_RATE);
-          const targetChannel = buffer.getChannelData(0);
-          targetChannel.set(audioData);
-
-          const source = context.createBufferSource();
-          source.buffer = buffer;
-          source.connect(context.destination);
-
-          playbackRef.current = { context, source, resolve };
-
-          source.onended = () => {
-            stopPlayback();
-            resolve();
-          };
-
-          if (context.state === 'suspended') {
-            context
-              .resume()
-              .then(() => {
-                source.start();
-              })
-              .catch(reject);
-          } else {
-            source.start();
+        source.onended = () => {
+          if (playbackRef.current.source === source) {
+            playbackRef.current = { context: null, source: null, resolve: null };
           }
-        } catch (error) {
-          reject(error);
+          audioContext.close().catch(() => {});
+          resolve();
+        };
+
+        const startPlayback = () => {
+          try {
+            source.start();
+          } catch (startError) {
+            source.disconnect();
+            audioContext.close().catch(() => {});
+            playbackRef.current = { context: null, source: null, resolve: null };
+            reject(startError);
+          }
+        };
+
+        if (audioContext.state === 'suspended') {
+          audioContext
+            .resume()
+            .then(startPlayback)
+            .catch((resumeError) => {
+              source.disconnect();
+              audioContext.close().catch(() => {});
+              playbackRef.current = { context: null, source: null, resolve: null };
+              reject(resumeError);
+            });
+        } else {
+          startPlayback();
         }
-      }),
-    [stopPlayback]
-  );
+      } catch (error) {
+        if (audioContext) {
+          audioContext.close().catch(() => {});
+        }
+        playbackRef.current = { context: null, source: null, resolve: null };
+        reject(error);
+      }
+    });
+  }, []);
+
+  const decodeAudioBuffer = useCallback((audioContext, arrayBuffer) => {
+    const copy = arrayBuffer.slice(0);
+    const maybePromise = audioContext.decodeAudioData(copy);
+    if (maybePromise && typeof maybePromise.then === 'function') {
+      return maybePromise;
+    }
+    return new Promise((resolve, reject) => {
+      audioContext.decodeAudioData(copy, resolve, reject);
+    });
+  }, []);
 
   const enumerateAudioDevices = useCallback(async () => {
     if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) {
-      addLog('[DEVICE] Media device enumeration is not supported in this browser.', LOG_TYPES.WARNING);
+      addLog('\u{1F399}\uFE0F DEVICE WARNING: Media device enumeration is not supported in this browser.', LOG_TYPES.WARNING);
       return;
     }
     try {
@@ -174,9 +193,8 @@ export default function useSileroVad() {
 
       audioInputs.forEach((device, index) => {
         const deviceId = device.deviceId || `device-${index}`;
-        const label = device.label && device.label.trim().length > 0
-          ? device.label
-          : `Microphone ${unnamedIndex++}`;
+        const label =
+          device.label && device.label.trim().length > 0 ? device.label : `Microphone ${unnamedIndex++}`;
 
         if (deviceId === 'default') {
           defaultLabel = label;
@@ -193,26 +211,17 @@ export default function useSileroVad() {
       ];
 
       setDevices(nextDevices);
-      addLog(
-        `[DEVICE] Found ${audioInputs.length} audio input device(s).`,
-        LOG_TYPES.INFO
-      );
+      addLog(`\u{1F399}\uFE0F DEVICE: Found ${audioInputs.length} audio input device(s).`, LOG_TYPES.INFO);
 
       const stillValid = nextDevices.some((device) => device.deviceId === selectedDeviceId);
       if (!stillValid) {
         if (selectedDeviceId !== DEFAULT_DEVICE_ID) {
-          addLog(
-            '[DEVICE] Previous microphone is no longer available. Reverting to default microphone.',
-            LOG_TYPES.WARNING
-          );
+          addLog('\u{1F399}\uFE0F DEVICE WARNING: Previous microphone is unavailable. Reverting to default.', LOG_TYPES.WARNING);
         }
         setSelectedDeviceId(DEFAULT_DEVICE_ID);
       }
     } catch (error) {
-      addLog(
-        `[DEVICE] Unable to enumerate audio devices: ${error.message || error}`,
-        LOG_TYPES.WARNING
-      );
+      addLog(`\u{1F399}\uFE0F DEVICE WARNING: Unable to enumerate microphones (${error.message || error}).`, LOG_TYPES.WARNING);
     }
   }, [addLog, selectedDeviceId]);
 
@@ -224,6 +233,9 @@ export default function useSileroVad() {
 
       processingRef.current = true;
 
+      let audioContext = null;
+      let requestPayloadSnapshot = null;
+
       try {
         setPipelineState(PIPELINE_STATES.SILENCE_DETECTED);
 
@@ -234,53 +246,79 @@ export default function useSileroVad() {
 
         setPipelineState(PIPELINE_STATES.SENDING_TO_BACKEND);
         setStatus('Preparing payload for backend...');
-        addLog('[PIPELINE] Preparing backend payload.', LOG_TYPES.INFO);
-        const payload = sendAudioToBackend(audioData, {
+
+        const sendResult = await sendAudioToBackend(audioData, {
           sourceLanguage,
           targetLanguage,
           neuralVoice,
+          backendUrl,
+          showFullRequest,
+          onBeforeSend: ({ payload, endpoint, requestBytes }) => {
+            requestPayloadSnapshot = payload;
+            setLastPayload(payload);
+
+            const audioString = typeof payload.audio_data === 'string' ? payload.audio_data : '';
+            const preview = audioString ? audioString.slice(0, 50) : '';
+            const ellipsis = audioString && audioString.length > 50 ? '...' : '';
+            const payloadPreview = {
+              ...payload,
+              audio_data: audioString
+                ? `${preview}${ellipsis} (${requestBytes} bytes)`
+                : '(no audio data)',
+            };
+
+            addLog(`\u{1F4E4} HTTP REQUEST: Sending to ${endpoint}`, LOG_TYPES.INFO);
+            addLog(`\u{1F4CB} REQUEST PAYLOAD:\n${JSON.stringify(payloadPreview, null, 2)}`, LOG_TYPES.INFO);
+            addLog('\u23F3 WAITING: Backend processing (STT \u2192 Translate \u2192 TTS)...', LOG_TYPES.INFO);
+            setStatus('Waiting for backend response...');
+          },
         });
-        setLastPayload(payload);
-
-        const audioString = payload && typeof payload.audio_data === 'string' ? payload.audio_data : '';
-        const maxPreviewLength = 50;
-        let truncated = '';
-        let byteEstimate = 0;
-        if (audioString) {
-          truncated =
-            audioString.length > maxPreviewLength
-              ? `${audioString.slice(0, maxPreviewLength)}...`
-              : audioString;
-          byteEstimate = Math.round((audioString.length * 3) / 4);
-        }
-
-        const payloadForLog = {
-          ...payload,
-          audio_data: audioString ? `${truncated} (${byteEstimate} bytes)` : '(no audio data)',
-        };
-        addLog(
-          `[PIPELINE] JSON payload generated:\n${JSON.stringify(payloadForLog, null, 2)}`,
-          LOG_TYPES.INFO
-        );
 
         if (!shouldContinueRef.current) {
-          setPipelineState(PIPELINE_STATES.IDLE);
+          return;
+        }
+
+        const { responseArrayBuffer, responseContentType, responseBytes, payload } = sendResult;
+        if (payload) {
+          setLastPayload(payload);
+        }
+
+        addLog(
+          `\u2705 HTTP RESPONSE: Received translated audio (${responseBytes} bytes, content-type: ${responseContentType})`,
+          LOG_TYPES.SUCCESS
+        );
+
+        const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+        if (!AudioContextCtor) {
+          const decodeError = new Error('Web Audio API is not supported in this browser.');
+          decodeError.code = 'decode_error';
+          throw decodeError;
+        }
+
+        stopPlayback();
+
+        audioContext = new AudioContextCtor();
+        setStatus('Decoding translated audio...');
+        const audioBuffer = await decodeAudioBuffer(audioContext, responseArrayBuffer);
+
+        if (!shouldContinueRef.current) {
+          await audioContext.close();
+          audioContext = null;
           return;
         }
 
         setPipelineState(PIPELINE_STATES.PLAYING_AUDIO);
-        setStatus('Playing recorded audio...');
-        addLog('[PIPELINE] Playback starting.', LOG_TYPES.INFO);
-        await playAudioData(audioData);
-        addLog('[PIPELINE] Playback complete.', LOG_TYPES.SUCCESS);
+        setStatus('Playing translated audio...');
+        addLog('\u{1F50A} PLAYBACK: Playing translated audio...', LOG_TYPES.INFO);
+        await playAudioBuffer(audioContext, audioBuffer);
+        audioContext = null;
+        addLog('\u2705 PLAYBACK COMPLETE', LOG_TYPES.SUCCESS);
 
         if (!shouldContinueRef.current) {
-          setStatus('Idle.');
-          setPipelineState(PIPELINE_STATES.IDLE);
           return;
         }
 
-        addLog('[PIPELINE] Auto-restart: listening again.', LOG_TYPES.INFO);
+        addLog('\u{1F504} AUTO-RESTART: Starting listening again...', LOG_TYPES.INFO);
         setPipelineState(PIPELINE_STATES.LISTENING);
         setStatus('Listening...');
 
@@ -288,22 +326,69 @@ export default function useSileroVad() {
           engineRef.current.start();
         }
       } catch (error) {
-        console.error('[Pipeline] Error during processing', error);
-        setStatus(`Pipeline error: ${error.message || String(error)}`);
-        setPipelineState(PIPELINE_STATES.IDLE);
+        console.error('[Pipeline] Error during backend integration', error);
+
+        if (audioContext) {
+          try {
+            audioContext.close();
+          } catch (closeError) {
+            console.warn('AudioContext close failed', closeError);
+          }
+          audioContext = null;
+        }
+
         stopPlayback({ invokeResolve: true });
+
+        if (error?.code === 'network_error') {
+          addLog('\u274C NETWORK ERROR: Failed to connect to backend', LOG_TYPES.WARNING);
+        } else if (error?.code === 'http_error') {
+          addLog(
+            `\u274C HTTP ERROR: ${error.status} - ${error.statusText || 'Unknown error'}`,
+            LOG_TYPES.WARNING
+          );
+          if (error.body) {
+            addLog(`Response body: ${error.body}`, LOG_TYPES.WARNING);
+          }
+        } else if (error?.code === 'invalid_content_type') {
+          addLog(
+            `\u274C HTTP ERROR: Unexpected response type ${error.contentType || 'unknown'}`,
+            LOG_TYPES.WARNING
+          );
+        } else if (error?.code === 'decode_error') {
+          addLog('\u274C DECODE ERROR: Cannot decode audio response', LOG_TYPES.WARNING);
+        } else {
+          addLog(`\u274C UNKNOWN ERROR: ${error.message || error}`, LOG_TYPES.WARNING);
+        }
+
+        if (requestPayloadSnapshot) {
+          setLastPayload(requestPayloadSnapshot);
+        }
+
+        if (engineRef.current) {
+          try {
+            engineRef.current.stop();
+          } catch (engineError) {
+            console.warn('Engine stop failed', engineError);
+          }
+        }
+
+        setStatus('Error - Click Start to retry');
+        setPipelineState(PIPELINE_STATES.IDLE);
         shouldContinueRef.current = false;
         setIsActive(false);
-        addLog(`[ERROR] Pipeline error: ${error.message || String(error)}`, LOG_TYPES.WARNING);
+        return;
       } finally {
         processingRef.current = false;
       }
     },
     [
       addLog,
+      backendUrl,
+      decodeAudioBuffer,
       neuralVoice,
-      playAudioData,
+      playAudioBuffer,
       ready,
+      showFullRequest,
       sourceLanguage,
       stopPlayback,
       targetLanguage,
@@ -346,10 +431,10 @@ export default function useSileroVad() {
     (nextState) => {
       if (nextState === ENGINE_STATES.LISTENING && shouldContinueRef.current) {
         setPipelineState(PIPELINE_STATES.LISTENING);
-        addLog('[STATE] Listening for speech.', LOG_TYPES.INFO);
+        addLog('\u{1F3A4} LISTENING: Recording audio...', LOG_TYPES.INFO);
       } else if (nextState === ENGINE_STATES.RECORDING) {
         setPipelineState(PIPELINE_STATES.RECORDING);
-        addLog('[STATE] Speech detected.', LOG_TYPES.INFO);
+        addLog('\u{1F50A} SPEAKING: Voice detected', LOG_TYPES.INFO);
       } else if (nextState === ENGINE_STATES.SILENCE_DETECTED) {
         setPipelineState(PIPELINE_STATES.SILENCE_DETECTED);
       } else if (nextState === ENGINE_STATES.IDLE && !shouldContinueRef.current) {
@@ -364,10 +449,7 @@ export default function useSileroVad() {
       const duration =
         typeof detectedDuration === 'number' ? detectedDuration : silenceDurationRef.current;
       silenceDurationRef.current = duration;
-      addLog(
-        `[STATE] Silence detected after ${duration.toFixed(1)} second(s).`,
-        LOG_TYPES.WARNING
-      );
+      addLog(`\u{1F507} SILENCE DETECTED: After ${duration.toFixed(1)}s of silence`, LOG_TYPES.WARNING);
     },
     [addLog]
   );
@@ -376,7 +458,7 @@ export default function useSileroVad() {
     (info) => {
       const attemptedId = info && info.deviceId ? info.deviceId : 'requested device';
       addLog(
-        `[DEVICE] Requested microphone (${attemptedId}) is unavailable. Falling back to default microphone.`,
+        `\u{1F399}\uFE0F DEVICE ERROR: Microphone "${attemptedId}" unavailable. Falling back to default.`,
         LOG_TYPES.WARNING
       );
     },
@@ -411,7 +493,7 @@ export default function useSileroVad() {
           setReady(true);
           setStatus('Ready. Press Start to begin.');
           setPipelineState(PIPELINE_STATES.IDLE);
-          addLog('[INIT] Model ready. Awaiting start.', LOG_TYPES.SUCCESS);
+          addLog('\u2705 Model ready. Awaiting Start command.', LOG_TYPES.SUCCESS);
         }
       })
       .catch((error) => {
@@ -419,7 +501,7 @@ export default function useSileroVad() {
         if (!cancelled) {
           const reason = error && error.message ? error.message : String(error);
           setStatus(`Initialization failed: ${reason}`);
-          addLog(`[ERROR] Initialization failed: ${reason}`, LOG_TYPES.WARNING);
+          addLog(`\u274C INIT ERROR: ${reason}`, LOG_TYPES.WARNING);
         }
       });
 
@@ -449,6 +531,7 @@ export default function useSileroVad() {
     const handleChange = () => {
       enumerateAudioDevices();
     };
+
     navigator.mediaDevices.addEventListener('devicechange', handleChange);
     return () => {
       navigator.mediaDevices.removeEventListener('devicechange', handleChange);
@@ -475,11 +558,11 @@ export default function useSileroVad() {
     setIsActive(true);
     setPipelineState(PIPELINE_STATES.LISTENING);
     setStatus('Preparing microphone...');
-    addLog('[CONTROL] Start button clicked.', LOG_TYPES.INFO);
-    engineRef.current.setDevice(
-      selectedDeviceId === DEFAULT_DEVICE_ID ? null : selectedDeviceId
-    );
+    addLog('\u25B6 START: User clicked Start button', LOG_TYPES.INFO);
+
+    engineRef.current.setDevice(selectedDeviceId === DEFAULT_DEVICE_ID ? null : selectedDeviceId);
     engineRef.current.start();
+
     setTimeout(() => {
       enumerateAudioDevices();
     }, 500);
@@ -495,7 +578,7 @@ export default function useSileroVad() {
     setIsActive(false);
     setPipelineState(PIPELINE_STATES.IDLE);
     setStatus('Idle.');
-    addLog('[CONTROL] Stop button clicked.', LOG_TYPES.WARNING);
+    addLog('\u23F9 STOP: User clicked Stop button', LOG_TYPES.WARNING);
   }, [addLog, stopPlayback]);
 
   useEffect(() => {
@@ -510,13 +593,15 @@ export default function useSileroVad() {
       const deviceLabel =
         devices.find((device) => device.deviceId === normalizedId)?.label || 'System Default';
 
-      addLog(`[DEVICE] Device changed: now using ${deviceLabel}.`, LOG_TYPES.INFO);
+      addLog(`\u{1F399}\uFE0F DEVICE CHANGED: Now using ${deviceLabel}`, LOG_TYPES.INFO);
 
       if (engineRef.current) {
         engineRef.current.setDevice(normalizedId === DEFAULT_DEVICE_ID ? null : normalizedId);
-        if (shouldContinueRef.current) {
-          addLog('[DEVICE] Restarting capture with the selected microphone.', LOG_TYPES.INFO);
-        }
+      }
+
+      if (shouldContinueRef.current) {
+        addLog(`\u{1F504} RESTARTING: Switching to new microphone (${deviceLabel})...`, LOG_TYPES.INFO);
+        setStatus('Switching to new microphone...');
       }
     },
     [addLog, devices]
@@ -549,5 +634,14 @@ export default function useSileroVad() {
     selectedDeviceId,
     setSelectedDeviceId: handleDeviceSelection,
     selectedDeviceLabel,
+    backendUrl,
+    setBackendUrl,
+    showFullRequest,
+    setShowFullRequest,
   };
 }
+
+
+
+
+
