@@ -1,47 +1,52 @@
-import { useState } from 'react';
 import useSileroVad from './hooks/useSileroVad';
+import VadStatusIndicator from './components/VadStatusIndicator';
+import SilenceDurationControl from './components/SilenceDurationControl';
 import './App.css';
 
 function App() {
-  const { status, start, stop, ready } = useSileroVad();
-  const [capturing, setCapturing] = useState(false);
+  const {
+    status,
+    start,
+    stop,
+    ready,
+    engineState,
+    silenceDuration,
+    setSilenceDuration,
+    isActive,
+  } = useSileroVad();
 
   const handleStart = () => {
     if (!ready) {
       return;
     }
     start();
-    setCapturing(true);
   };
 
   const handleStop = () => {
     stop();
-    setCapturing(false);
   };
 
   return (
     <div className="app-shell">
-      <h1>Silero VAD (ONNX Runtime Web)</h1>
-      <p className="status-label">{status}</p>
-      <div className="actions">
-        <button
-          type="button"
-          onClick={handleStart}
-          disabled={!ready || capturing}
-        >
-          {ready ? 'Start Listening' : 'Loading Model...'}
-        </button>
-        <button
-          type="button"
-          onClick={handleStop}
-          disabled={!capturing}
-        >
-          Stop
-        </button>
+      <h1 className="app-title">Speech to Speech Translator App</h1>
+      <div className="vad-toolbar">
+        <VadStatusIndicator
+          status={status}
+          ready={ready}
+          state={engineState}
+          isActive={isActive}
+          onStart={handleStart}
+          onStop={handleStop}
+        />
+        <SilenceDurationControl
+          value={silenceDuration}
+          min={0.5}
+          max={5}
+          step={0.5}
+          onChange={setSilenceDuration}
+          disabled={!ready}
+        />
       </div>
-      <p className="note">
-        Allow microphone access when prompted. The detector restarts automatically after silence.
-      </p>
     </div>
   );
 }

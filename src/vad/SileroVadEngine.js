@@ -7,8 +7,24 @@ const CHUNK_SAMPLES = 512; // ~32ms at 16kHz
 const CONTEXT_SAMPLES = 64;
 const STATE_SIZE = 2 * 1 * 128;
 const SPEECH_THRESHOLD = 0.5;
-const SILENCE_TIMEOUT_MS = 2000;
-const BUFFER_DURATION_MS = 2000;
+const DEFAULT_SILENCE_SECONDS = 2;
+const MIN_SILENCE_SECONDS = 0.5;
+const MAX_SILENCE_SECONDS = 5;
+
+const ENGINE_STATES = {
+  IDLE: 'IDLE',
+  LISTENING: 'LISTENING',
+  RECORDING: 'RECORDING',
+  SILENCE_DETECTED: 'SILENCE_DETECTED',
+  PLAYING_BACK: 'PLAYING_BACK',
+};
+
+function clamp(value, min, max) {
+  if (Number.isNaN(value)) {
+    return min;
+  }
+  return Math.min(Math.max(value, min), max);
+}
 
 function cloneFloat32(source) {
   const copy = new Float32Array(source.length);
@@ -44,8 +60,22 @@ function resolveMediaStream(callback, errorCallback) {
 export default function createSileroVadEngine(options) {
   const config = options || {};
   const modelPath = config.modelPath || `${process.env.PUBLIC_URL || ''}/silero_vad.onnx`;
-  const statusListener = typeof config.onStatusChange === 'function' ? config.onStatusChange : () => {};
+  const statusListener =
+    typeof config.onStatusChange === 'function' ? config.onStatusChange : () => {};
+  const stateListener = typeof config.onStateChange === 'function' ? config.onStateChange : () => {};
+  const recordingCompleteListener =
+    typeof config.onRecordingComplete === 'function' ? config.onRecordingComplete : () => {};
+  const playbackStartListener =
+    typeof config.onPlaybackStart === 'function' ? config.onPlaybackStart : () => {};
+  const playbackEndListener =
+    typeof config.onPlaybackEnd === 'function' ? config.onPlaybackEnd : () => {};
   const logSilence = config.logSilence !== false;
+
+  let silenceDurationSeconds = clamp(
+    typeof config.silenceDuration === 'number' ? config.silenceDuration : DEFAULT_SILENCE_SECONDS,
+    MIN_SILENCE_SECONDS,
+    MAX_SILENCE_SECONDS
+  );
 
   let session = null;
   let audioContext = null;
@@ -56,6 +86,11 @@ export default function createSileroVadEngine(options) {
   let sessionReady = false;
   let disposed = false;
   let runningInference = false;
+  let pendingCapture = false;
+  let active = false;
+  let capturing = false;
+  let playbackContext = null;
+  let playbackSource = null;
 
   let contextBuffer = new Float32Array(CONTEXT_SAMPLES);
   let stateBuffer = new Float32Array(STATE_SIZE);
@@ -65,12 +100,15 @@ export default function createSileroVadEngine(options) {
   let pendingResidual = new Float32Array(0);
   let chunkQueue = [];
   let speaking = false;
-  let currentStatus = 'Listening...';
+  let currentStatus = 'Loading model...';
+  let engineState = ENGINE_STATES.IDLE;
+
+  let recordingBuffers = [];
+  let recordingLength = 0;
 
   const chunkDurationMs = (CHUNK_SAMPLES / TARGET_SAMPLE_RATE) * 1000;
-  const ringBufferSize = Math.max(1, Math.round(BUFFER_DURATION_MS / chunkDurationMs));
-  const silenceFramesRequired = Math.max(1, Math.round(SILENCE_TIMEOUT_MS / chunkDurationMs));
-  const silenceRing = createRingBuffer(ringBufferSize);
+  let silenceFramesRequired = 1;
+  let silenceRing = createRingBuffer(1);
 
   function setStatus(nextStatus) {
     if (currentStatus !== nextStatus) {
@@ -79,7 +117,54 @@ export default function createSileroVadEngine(options) {
     }
   }
 
-  function resetState() {
+  function setEngineState(nextState, statusMessage) {
+    if (engineState !== nextState) {
+      engineState = nextState;
+      stateListener(engineState);
+    }
+    if (typeof statusMessage === 'string') {
+      setStatus(statusMessage);
+    }
+  }
+
+  function resetRecording() {
+    recordingBuffers = [];
+    recordingLength = 0;
+  }
+
+  function appendToRecording(chunk) {
+    if (!capturing || !chunk || chunk.length === 0) {
+      return;
+    }
+    recordingBuffers.push(Float32Array.from(chunk));
+    recordingLength += chunk.length;
+  }
+
+  function collectRecording() {
+    if (recordingLength === 0) {
+      return new Float32Array(0);
+    }
+    const merged = new Float32Array(recordingLength);
+    let offset = 0;
+    for (let i = 0; i < recordingBuffers.length; i += 1) {
+      merged.set(recordingBuffers[i], offset);
+      offset += recordingBuffers[i].length;
+    }
+    return merged;
+  }
+
+  function updateSilenceDuration(seconds) {
+    silenceDurationSeconds = clamp(seconds, MIN_SILENCE_SECONDS, MAX_SILENCE_SECONDS);
+    silenceFramesRequired = Math.max(
+      1,
+      Math.round((silenceDurationSeconds * 1000) / chunkDurationMs)
+    );
+    silenceRing = createRingBuffer(Math.max(1, silenceFramesRequired));
+  }
+
+  updateSilenceDuration(silenceDurationSeconds);
+
+  function resetInferenceState() {
     contextBuffer.fill(0);
     stateBuffer.fill(0);
     stateTensor = new ort.Tensor('float32', stateBuffer, [2, 1, 128]);
@@ -87,7 +172,297 @@ export default function createSileroVadEngine(options) {
     chunkQueue = [];
     silenceRing.clear();
     speaking = false;
-    setStatus('Listening...');
+  }
+
+  resetInferenceState();
+
+  function stopPlayback() {
+    if (playbackSource) {
+      try {
+        playbackSource.stop();
+      } catch (error) {
+        console.warn('[SileroVAD] Unable to stop playback source', error);
+      }
+      playbackSource.disconnect();
+      playbackSource = null;
+    }
+    if (playbackContext) {
+      playbackContext.close().catch(() => {});
+      playbackContext = null;
+    }
+  }
+
+  function playRecording(floatData) {
+    return new Promise((resolve, reject) => {
+      if (!floatData || floatData.length === 0) {
+        resolve();
+        return;
+      }
+
+      const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContextCtor) {
+        reject(new Error('Web Audio API not supported'));
+        return;
+      }
+
+      try {
+        playbackContext = new AudioContextCtor();
+        const audioBuffer = playbackContext.createBuffer(1, floatData.length, TARGET_SAMPLE_RATE);
+        const channel = audioBuffer.getChannelData(0);
+        channel.set(floatData);
+
+        playbackSource = playbackContext.createBufferSource();
+        playbackSource.buffer = audioBuffer;
+        playbackSource.connect(playbackContext.destination);
+
+        playbackSource.onended = () => {
+          stopPlayback();
+          resolve();
+        };
+
+        if (playbackContext.state === 'suspended') {
+          playbackContext
+            .resume()
+            .then(() => playbackSource.start())
+            .catch(reject);
+        } else {
+          playbackSource.start();
+        }
+      } catch (error) {
+        reject(error);
+      }
+    });
+  }
+
+  function clearProcessingQueues() {
+    chunkQueue = [];
+    pendingResidual = new Float32Array(0);
+    silenceRing.clear();
+    speaking = false;
+  }
+
+  function handlePlaybackLoopCompletion() {
+    stopPlayback();
+    playbackEndListener();
+    resetRecording();
+    resetInferenceState();
+    if (disposed || !active) {
+      setEngineState(ENGINE_STATES.IDLE, 'Idle');
+      return;
+    }
+    setEngineState(ENGINE_STATES.LISTENING, 'Preparing microphone...');
+    requestCapture();
+  }
+
+  function handleSilenceDetected() {
+    if (engineState === ENGINE_STATES.PLAYING_BACK || engineState === ENGINE_STATES.SILENCE_DETECTED) {
+      return;
+    }
+    if (logSilence) {
+      console.log(`[SileroVAD] Silence detected after ${silenceDurationSeconds.toFixed(2)}s`);
+    }
+    setEngineState(ENGINE_STATES.SILENCE_DETECTED, 'Silence detected.');
+    clearProcessingQueues();
+    releaseAudioResources();
+
+    const recorded = collectRecording();
+    recordingCompleteListener(recorded);
+
+    if (!recorded || recorded.length === 0) {
+      handlePlaybackLoopCompletion();
+      return;
+    }
+
+    setEngineState(ENGINE_STATES.PLAYING_BACK, 'Playing back...');
+    playbackStartListener();
+
+    playRecording(recorded)
+      .catch((error) => {
+        console.error('[SileroVAD] Playback error', error);
+        setStatus('Playback error');
+      })
+      .finally(handlePlaybackLoopCompletion);
+  }
+
+  function prepareInput(chunk) {
+    const buffer = new Float32Array(CONTEXT_SAMPLES + CHUNK_SAMPLES);
+    buffer.set(contextBuffer, 0);
+    buffer.set(chunk, CONTEXT_SAMPLES);
+    contextBuffer.set(buffer.subarray(buffer.length - CONTEXT_SAMPLES));
+    return buffer;
+  }
+
+  function enqueueChunk(chunk) {
+    const payload = cloneFloat32(chunk);
+    chunkQueue.push(payload);
+    processQueue();
+  }
+
+  function updateStateTensor(nextState) {
+    if (!nextState) {
+      return;
+    }
+    if (!stateTensor || !stateTensor.data) {
+      stateTensor = new ort.Tensor('float32', stateBuffer, nextState.dims);
+    }
+    stateBuffer.set(nextState.data);
+  }
+
+  function processQueue() {
+    if (
+      !sessionReady ||
+      runningInference ||
+      chunkQueue.length === 0 ||
+      engineState === ENGINE_STATES.PLAYING_BACK
+    ) {
+      return;
+    }
+
+    runningInference = true;
+    const chunk = chunkQueue.shift();
+    const inputBuffer = prepareInput(chunk);
+
+    const feeds = {
+      input: new ort.Tensor('float32', inputBuffer, [1, inputBuffer.length]),
+      state: stateTensor,
+      sr: sampleRateTensor,
+    };
+
+    session
+      .run(feeds)
+      .then((result) => {
+        const speechProb = result.output && result.output.data ? Number(result.output.data[0]) : 0;
+        updateStateTensor(result.stateN);
+        handleDetection(speechProb);
+      })
+      .catch((error) => {
+        console.error('[SileroVAD] Inference failed', error);
+        setStatus('Error during inference');
+      })
+      .finally(() => {
+        runningInference = false;
+        processQueue();
+      });
+  }
+
+  function handleDetection(probability) {
+    if (!active || engineState === ENGINE_STATES.PLAYING_BACK) {
+      return;
+    }
+
+    const isSpeech = probability > SPEECH_THRESHOLD;
+    silenceRing.push(isSpeech ? 1 : 0);
+
+    if (isSpeech) {
+      if (!speaking) {
+        setEngineState(ENGINE_STATES.RECORDING, 'Recording...');
+      }
+      speaking = true;
+      return;
+    }
+
+    if (speaking) {
+      setEngineState(ENGINE_STATES.LISTENING, 'Listening...');
+    }
+    speaking = false;
+
+    if (silenceRing.size() >= silenceFramesRequired && silenceRing.sum() === 0) {
+      handleSilenceDetected();
+    }
+  }
+
+  function downsampleAndSchedule(inputChunk) {
+    if (!downsampler || engineState === ENGINE_STATES.PLAYING_BACK || !active) {
+      return;
+    }
+    const resampled = downsampler.process(inputChunk);
+    if (!resampled || resampled.length === 0) {
+      return;
+    }
+
+    appendToRecording(resampled);
+
+    const merged = new Float32Array(pendingResidual.length + resampled.length);
+    merged.set(pendingResidual, 0);
+    merged.set(resampled, pendingResidual.length);
+
+    let offset = 0;
+    while (offset + CHUNK_SAMPLES <= merged.length) {
+      const slice = merged.subarray(offset, offset + CHUNK_SAMPLES);
+      enqueueChunk(slice);
+      offset += CHUNK_SAMPLES;
+    }
+
+    pendingResidual = merged.slice(offset);
+  }
+
+  function attachProcessor(stream) {
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    downsampler = createDownsampler(audioContext.sampleRate, TARGET_SAMPLE_RATE);
+    sampleRateTensor = new ort.Tensor('int64', BigInt64Array.from([BigInt(TARGET_SAMPLE_RATE)]));
+
+    if (audioContext.state === 'suspended') {
+      audioContext.resume();
+    }
+
+    inputSource = audioContext.createMediaStreamSource(stream);
+    processorNode = audioContext.createScriptProcessor(2048, 1, 1);
+    processorNode.onaudioprocess = (event) => {
+      downsampleAndSchedule(event.inputBuffer.getChannelData(0));
+    };
+    inputSource.connect(processorNode);
+    processorNode.connect(audioContext.destination);
+    capturing = true;
+    resetRecording();
+    setEngineState(ENGINE_STATES.LISTENING, 'Listening...');
+  }
+
+  function releaseAudioResources() {
+    capturing = false;
+    if (processorNode) {
+      processorNode.disconnect();
+      processorNode.onaudioprocess = null;
+      processorNode = null;
+    }
+    if (inputSource) {
+      inputSource.disconnect();
+      inputSource = null;
+    }
+    if (streamRef) {
+      streamRef.getTracks().forEach((track) => track.stop());
+      streamRef = null;
+    }
+    if (audioContext) {
+      audioContext.close().catch(() => {});
+      audioContext = null;
+    }
+    downsampler = null;
+  }
+
+  function requestCapture() {
+    if (!active || disposed || pendingCapture) {
+      return;
+    }
+    pendingCapture = true;
+    resetInferenceState();
+
+    resolveMediaStream(
+      (stream) => {
+        pendingCapture = false;
+        if (disposed || !active) {
+          stream.getTracks().forEach((track) => track.stop());
+          return;
+        }
+        console.info('[SileroVAD] Microphone access granted');
+        streamRef = stream;
+        attachProcessor(stream);
+      },
+      (error) => {
+        pendingCapture = false;
+        console.error('[SileroVAD] Unable to access microphone', error);
+        setStatus('Microphone access denied');
+      }
+    );
   }
 
   function configureOrt() {
@@ -132,176 +507,9 @@ export default function createSileroVadEngine(options) {
     return modelBytes;
   }
 
-  function prepareInput(chunk) {
-    const buffer = new Float32Array(CONTEXT_SAMPLES + CHUNK_SAMPLES);
-    buffer.set(contextBuffer, 0);
-    buffer.set(chunk, CONTEXT_SAMPLES);
-    contextBuffer.set(buffer.subarray(buffer.length - CONTEXT_SAMPLES));
-    return buffer;
-  }
-
-  function enqueueChunk(chunk) {
-    const payload = cloneFloat32(chunk);
-    chunkQueue.push(payload);
-    processQueue();
-  }
-
-  function updateStateTensor(nextState) {
-    if (!nextState) {
-      return;
-    }
-    if (!stateTensor || !stateTensor.data) {
-      stateTensor = new ort.Tensor('float32', stateBuffer, nextState.dims);
-    }
-    stateBuffer.set(nextState.data);
-  }
-
-  function processQueue() {
-    if (!sessionReady || runningInference || chunkQueue.length === 0) {
-      return;
-    }
-
-    runningInference = true;
-    const chunk = chunkQueue.shift();
-    const inputBuffer = prepareInput(chunk);
-
-    const feeds = {
-      input: new ort.Tensor('float32', inputBuffer, [1, inputBuffer.length]),
-      state: stateTensor,
-      sr: sampleRateTensor,
-    };
-
-    session
-      .run(feeds)
-      .then((result) => {
-        const speechProb = result.output && result.output.data ? Number(result.output.data[0]) : 0;
-        updateStateTensor(result.stateN);
-        handleDetection(speechProb);
-      })
-      .catch((error) => {
-        console.error('[SileroVAD] Inference failed', error);
-        setStatus('Error during inference');
-      })
-      .finally(() => {
-        runningInference = false;
-        processQueue();
-      });
-  }
-
-  function handleDetection(probability) {
-    const isSpeech = probability > SPEECH_THRESHOLD;
-    silenceRing.push(isSpeech ? 1 : 0);
-
-    if (isSpeech) {
-      if (!speaking) {
-        setStatus('Speaking...');
-      }
-      speaking = true;
-      return;
-    }
-
-    if (speaking) {
-      setStatus('Listening...');
-    }
-    speaking = false;
-
-    if (silenceRing.size() >= silenceFramesRequired && silenceRing.sum() === 0) {
-      if (logSilence) {
-        console.log('Silence detected');
-      }
-      setStatus('Silence detected.');
-      restartCapture();
-    }
-  }
-
-  function downsampleAndSchedule(inputChunk) {
-    if (!downsampler) {
-      return;
-    }
-    const resampled = downsampler.process(inputChunk);
-    if (!resampled || resampled.length === 0) {
-      return;
-    }
-    const merged = new Float32Array(pendingResidual.length + resampled.length);
-    merged.set(pendingResidual, 0);
-    merged.set(resampled, pendingResidual.length);
-
-    let offset = 0;
-    while (offset + CHUNK_SAMPLES <= merged.length) {
-      const slice = merged.subarray(offset, offset + CHUNK_SAMPLES);
-      enqueueChunk(slice);
-      offset += CHUNK_SAMPLES;
-    }
-
-    pendingResidual = merged.slice(offset);
-  }
-
-  function attachProcessor(stream) {
-    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    downsampler = createDownsampler(audioContext.sampleRate, TARGET_SAMPLE_RATE);
-    sampleRateTensor = new ort.Tensor('int64', BigInt64Array.from([BigInt(TARGET_SAMPLE_RATE)]));
-
-    if (audioContext.state === 'suspended') {
-      audioContext.resume();
-    }
-
-    inputSource = audioContext.createMediaStreamSource(stream);
-    processorNode = audioContext.createScriptProcessor(2048, 1, 1);
-    processorNode.onaudioprocess = (event) => {
-      downsampleAndSchedule(event.inputBuffer.getChannelData(0));
-    };
-    inputSource.connect(processorNode);
-    processorNode.connect(audioContext.destination);
-  }
-
-  function releaseAudioResources() {
-    if (processorNode) {
-      processorNode.disconnect();
-      processorNode.onaudioprocess = null;
-      processorNode = null;
-    }
-    if (inputSource) {
-      inputSource.disconnect();
-      inputSource = null;
-    }
-    if (streamRef) {
-      streamRef.getTracks().forEach((track) => track.stop());
-      streamRef = null;
-    }
-    if (audioContext) {
-      audioContext.close().catch(() => {});
-      audioContext = null;
-    }
-  }
-
-  function restartCapture() {
-    releaseAudioResources();
-    resetState();
-    requestCapture();
-  }
-
-  function requestCapture() {
-    resolveMediaStream(
-      (stream) => {
-        if (disposed) {
-          stream.getTracks().forEach((track) => track.stop());
-          return;
-        }
-        console.info('[SileroVAD] Microphone access granted');
-        streamRef = stream;
-        attachProcessor(stream);
-        setStatus('Listening...');
-      },
-      (error) => {
-        console.error('[SileroVAD] Unable to access microphone', error);
-        setStatus('Microphone access denied');
-      }
-    );
-  }
-
   function initializeSession() {
     configureOrt();
-    resetState();
+    resetInferenceState();
     try {
       const modelBinary = loadModelBinary();
       console.info('[SileroVAD] Creating ONNX Runtime session');
@@ -314,9 +522,7 @@ export default function createSileroVadEngine(options) {
           console.info('[SileroVAD] Session created successfully');
           session = createdSession;
           sessionReady = true;
-          return session.getInputMetadata
-            ? session
-            : createdSession;
+          return session.getInputMetadata ? session : createdSession;
         })
         .catch((error) => {
           console.error('[SileroVAD] Failed to create ONNX session', error);
@@ -341,22 +547,39 @@ export default function createSileroVadEngine(options) {
       return initializeSession();
     },
     start() {
-      if (!sessionReady) {
+      if (!sessionReady || disposed) {
         return;
       }
+      active = true;
+      setEngineState(ENGINE_STATES.LISTENING, 'Preparing microphone...');
       requestCapture();
     },
     stop() {
+      active = false;
       releaseAudioResources();
-      resetState();
+      clearProcessingQueues();
+      stopPlayback();
+      resetRecording();
+      setEngineState(ENGINE_STATES.IDLE, 'Idle');
     },
     dispose() {
       disposed = true;
+      active = false;
       releaseAudioResources();
+      clearProcessingQueues();
+      stopPlayback();
       disposeSession();
+      setEngineState(ENGINE_STATES.IDLE, 'Disposed');
     },
     status() {
       return currentStatus;
+    },
+    state() {
+      return engineState;
+    },
+    setSilenceDuration(seconds) {
+      updateSilenceDuration(seconds);
+      silenceRing.clear();
     },
   };
 }
