@@ -65,6 +65,8 @@ export default function createSileroVadEngine(options) {
     typeof config.onStateChange === 'function' ? config.onStateChange : () => {};
   const recordingCompleteListener =
     typeof config.onRecordingComplete === 'function' ? config.onRecordingComplete : () => {};
+  const silenceDetectedListener =
+    typeof config.onSilenceDetected === 'function' ? config.onSilenceDetected : () => {};
   const logSilence = config.logSilence !== false;
 
   let silenceDurationSeconds = clamp(
@@ -180,6 +182,12 @@ export default function createSileroVadEngine(options) {
     capturing = false;
 
     setEngineState(ENGINE_STATES.SILENCE_DETECTED, 'Silence detected.');
+
+    try {
+      silenceDetectedListener(silenceDurationSeconds);
+    } catch (callbackError) {
+      console.warn('[SileroVAD] Silence detected listener error', callbackError);
+    }
 
     const recorded = collectRecording();
     releaseAudioResources();

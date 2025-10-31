@@ -31,11 +31,18 @@ const MIN_SILENCE_SECONDS = 0.5;
 const MAX_SILENCE_SECONDS = 5;
 const TARGET_SAMPLE_RATE = 16000;
 
+const LOG_TYPES = {
+  INFO: 'info',
+  SUCCESS: 'success',
+  WARNING: 'warning',
+};
+
 export default function useSileroVad() {
   const engineRef = useRef(null);
   const initialSilenceRef = useRef(DEFAULT_SILENCE_SECONDS);
   const handleRecordingRef = useRef(() => {});
   const handleStateChangeRef = useRef(() => {});
+  const silenceDurationRef = useRef(DEFAULT_SILENCE_SECONDS);
 
   const [status, setStatus] = useState('Loading model...');
   const [ready, setReady] = useState(false);
@@ -47,10 +54,28 @@ export default function useSileroVad() {
   const [sourceLanguage, setSourceLanguage] = useState(LANGUAGE_OPTIONS[0]);
   const [targetLanguage, setTargetLanguage] = useState(LANGUAGE_OPTIONS[1]);
   const [neuralVoice, setNeuralVoice] = useState(VOICE_OPTIONS[0]);
+  const [logs, setLogs] = useState([]);
 
   const shouldContinueRef = useRef(false);
   const playbackRef = useRef({ context: null, source: null, resolve: null });
   const processingRef = useRef(false);
+
+  const addLog = useCallback((message, type = LOG_TYPES.INFO) => {
+    setLogs((prev) => {
+      const now = new Date();
+      const entry = {
+        id: `${now.getTime()}-${Math.random().toString(16).slice(2, 8)}`,
+        time: now.toLocaleTimeString([], { hour12: false }),
+        message,
+        type,
+      };
+      return [...prev, entry];
+    });
+  }, []);
+
+  const clearLogs = useCallback(() => {
+    setLogs([]);
+  }, []);
 
   const stopPlayback = useCallback((options = {}) => {
     const { invokeResolve = false } = options;
@@ -149,6 +174,7 @@ export default function useSileroVad() {
 
         setPipelineState(PIPELINE_STATES.SENDING_TO_BACKEND);
         setStatus('Preparing payload for backend...');
+        addLog('📤 PREPARING BACKEND PAYLOAD: Encoding audio data...', LOG_TYPES.INFO);
         const payload = sendAudioToBackend(audioData, {
           sourceLanguage,
           targetLanguage,
@@ -161,6 +187,30 @@ export default function useSileroVad() {
         });
         setLastPayload(payload);
 
+        const audioDataString =
+          payload && typeof payload.audio_data === 'string' ? payload.audio_data : '';
+        const maxPreviewLength = 50;
+        let truncatedAudio = '';
+        let byteEstimate = 0;
+        if (audioDataString) {
+          truncatedAudio =
+            audioDataString.length > maxPreviewLength
+              ? `${audioDataString.slice(0, maxPreviewLength)}...`
+              : audioDataString;
+          byteEstimate = Math.round((audioDataString.length * 3) / 4);
+        }
+
+        const payloadForLog = {
+          ...payload,
+          audio_data: audioDataString
+            ? `${truncatedAudio} (${byteEstimate} bytes)`
+            : '(no audio data)',
+        };
+        addLog(
+          `📋 JSON GENERATED:\n${JSON.stringify(payloadForLog, null, 2)}`,
+          LOG_TYPES.INFO
+        );
+
         if (!shouldContinueRef.current) {
           setPipelineState(PIPELINE_STATES.IDLE);
           return;
@@ -168,7 +218,9 @@ export default function useSileroVad() {
 
         setPipelineState(PIPELINE_STATES.PLAYING_AUDIO);
         setStatus('Playing recorded audio...');
+        addLog('🔊 PLAYBACK: Playing recorded audio...', LOG_TYPES.INFO);
         await playAudioData(audioData);
+        addLog('✅ PLAYBACK COMPLETE', LOG_TYPES.SUCCESS);
 
         if (!shouldContinueRef.current) {
           setStatus('Idle.');
@@ -176,6 +228,7 @@ export default function useSileroVad() {
           return;
         }
 
+        addLog('🔄 AUTO-RESTART: Starting listening again...', LOG_TYPES.INFO);
         setPipelineState(PIPELINE_STATES.LISTENING);
         setStatus('Listening...');
 
@@ -189,11 +242,20 @@ export default function useSileroVad() {
         stopPlayback({ invokeResolve: true });
         shouldContinueRef.current = false;
         setIsActive(false);
+        addLog(`⚠️ PIPELINE ERROR: ${error.message || String(error)}`, LOG_TYPES.WARNING);
       } finally {
         processingRef.current = false;
       }
     },
-    [neuralVoice, playAudioData, ready, sourceLanguage, stopPlayback, targetLanguage]
+    [
+      addLog,
+      neuralVoice,
+      playAudioData,
+      ready,
+      sourceLanguage,
+      stopPlayback,
+      targetLanguage,
+    ]
   );
 
   const handleRecording = useCallback(
@@ -223,17 +285,22 @@ export default function useSileroVad() {
     [ready, runPipeline]
   );
 
-  const handleStateChange = useCallback((nextState) => {
-    if (nextState === ENGINE_STATES.LISTENING && shouldContinueRef.current) {
-      setPipelineState(PIPELINE_STATES.LISTENING);
-    } else if (nextState === ENGINE_STATES.RECORDING) {
-      setPipelineState(PIPELINE_STATES.RECORDING);
-    } else if (nextState === ENGINE_STATES.SILENCE_DETECTED) {
-      setPipelineState(PIPELINE_STATES.SILENCE_DETECTED);
-    } else if (nextState === ENGINE_STATES.IDLE && !shouldContinueRef.current) {
-      setPipelineState(PIPELINE_STATES.IDLE);
-    }
-  }, []);
+  const handleStateChange = useCallback(
+    (nextState) => {
+      if (nextState === ENGINE_STATES.LISTENING && shouldContinueRef.current) {
+        setPipelineState(PIPELINE_STATES.LISTENING);
+        addLog('🎤 LISTENING: Recording audio...', LOG_TYPES.INFO);
+      } else if (nextState === ENGINE_STATES.RECORDING) {
+        setPipelineState(PIPELINE_STATES.RECORDING);
+        addLog('🔊 SPEAKING: Voice detected', LOG_TYPES.INFO);
+      } else if (nextState === ENGINE_STATES.SILENCE_DETECTED) {
+        setPipelineState(PIPELINE_STATES.SILENCE_DETECTED);
+      } else if (nextState === ENGINE_STATES.IDLE && !shouldContinueRef.current) {
+        setPipelineState(PIPELINE_STATES.IDLE);
+      }
+    },
+    [addLog]
+  );
 
   useEffect(() => {
     handleRecordingRef.current = handleRecording;
@@ -249,6 +316,15 @@ export default function useSileroVad() {
       onStatusChange: setStatus,
       onStateChange: (state) => handleStateChangeRef.current(state),
       onRecordingComplete: (audioData) => handleRecordingRef.current(audioData),
+      onSilenceDetected: (detectedDuration) => {
+        const duration =
+          typeof detectedDuration === 'number' ? detectedDuration : silenceDurationRef.current;
+        silenceDurationRef.current = duration;
+        addLog(
+          `🔇 SILENCE DETECTED: After ${duration.toFixed(1)}s of silence`,
+          LOG_TYPES.WARNING
+        );
+      },
     });
     engineRef.current = engine;
 
@@ -261,6 +337,7 @@ export default function useSileroVad() {
           setReady(true);
           setStatus('Ready. Press Start to begin.');
           setPipelineState(PIPELINE_STATES.IDLE);
+          addLog('✅ Model ready. Awaiting Start command.', LOG_TYPES.SUCCESS);
         }
       })
       .catch((error) => {
@@ -281,7 +358,7 @@ export default function useSileroVad() {
         engineRef.current = null;
       }
     };
-  }, [stopPlayback]);
+  }, [addLog, stopPlayback]);
 
   const updateSilenceDuration = useCallback((value) => {
     const numericValue = Number(value);
@@ -303,8 +380,9 @@ export default function useSileroVad() {
     setIsActive(true);
     setPipelineState(PIPELINE_STATES.LISTENING);
     setStatus('Preparing microphone...');
+    addLog('▶ START: User clicked Start button', LOG_TYPES.INFO);
     engineRef.current.start();
-  }, [ready]);
+  }, [addLog, ready]);
 
   const stop = useCallback(() => {
     shouldContinueRef.current = false;
@@ -316,7 +394,12 @@ export default function useSileroVad() {
     setIsActive(false);
     setPipelineState(PIPELINE_STATES.IDLE);
     setStatus('Idle.');
-  }, [stopPlayback]);
+    addLog('⏹ STOP: User clicked Stop button', LOG_TYPES.WARNING);
+  }, [addLog, stopPlayback]);
+
+  useEffect(() => {
+    silenceDurationRef.current = silenceDuration;
+  }, [silenceDuration]);
 
   return {
     status,
@@ -335,5 +418,7 @@ export default function useSileroVad() {
     setSourceLanguage,
     setTargetLanguage,
     setNeuralVoice,
+    logs,
+    clearLogs,
   };
 }
