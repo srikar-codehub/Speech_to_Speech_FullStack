@@ -1,6 +1,11 @@
-import useSileroVad from './hooks/useSileroVad';
+import useSileroVad, {
+  PIPELINE_STATES,
+  LANGUAGE_OPTIONS,
+  VOICE_OPTIONS,
+} from './hooks/useSileroVad';
 import VadStatusIndicator from './components/VadStatusIndicator';
 import SilenceDurationControl from './components/SilenceDurationControl';
+import SelectControl from './components/SelectControl';
 import './App.css';
 
 function App() {
@@ -9,10 +14,16 @@ function App() {
     start,
     stop,
     ready,
-    engineState,
+    pipelineState,
     silenceDuration,
     setSilenceDuration,
     isActive,
+    sourceLanguage,
+    targetLanguage,
+    neuralVoice,
+    setSourceLanguage,
+    setTargetLanguage,
+    setNeuralVoice,
   } = useSileroVad();
 
   const handleStart = () => {
@@ -33,7 +44,7 @@ function App() {
         <VadStatusIndicator
           status={status}
           ready={ready}
-          state={engineState}
+          state={pipelineState || PIPELINE_STATES.IDLE}
           isActive={isActive}
           onStart={handleStart}
           onStop={handleStop}
@@ -45,6 +56,32 @@ function App() {
           step={0.5}
           onChange={setSilenceDuration}
           disabled={!ready}
+        />
+      </div>
+      <div className="select-grid">
+        <SelectControl
+          label="Source Language"
+          value={sourceLanguage}
+          options={LANGUAGE_OPTIONS}
+          onChange={setSourceLanguage}
+          disabled={!ready}
+          id="source-language-select"
+        />
+        <SelectControl
+          label="Target Language"
+          value={targetLanguage}
+          options={LANGUAGE_OPTIONS}
+          onChange={setTargetLanguage}
+          disabled={!ready}
+          id="target-language-select"
+        />
+        <SelectControl
+          label="Neural Voice"
+          value={neuralVoice}
+          options={VOICE_OPTIONS}
+          onChange={setNeuralVoice}
+          disabled={!ready}
+          id="neural-voice-select"
         />
       </div>
     </div>

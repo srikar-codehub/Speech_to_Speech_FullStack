@@ -7,6 +7,9 @@ export default function SilenceDurationControl({
   disabled = false,
   id = 'silence-duration-control',
 }) {
+  const numericValue = Number.isFinite(value) ? value : min;
+  const formattedValue = numericValue.toFixed(1);
+
   const handleRangeChange = (event) => {
     if (onChange) {
       onChange(Number(event.target.value));
@@ -24,8 +27,6 @@ export default function SilenceDurationControl({
     onChange(next);
   };
 
-  const formattedValue = Number.isFinite(value) ? value.toFixed(1) : '0.0';
-
   return (
     <div className="silence-control-card">
       <label className="silence-control-label" htmlFor={id}>
@@ -38,7 +39,7 @@ export default function SilenceDurationControl({
           min={min}
           max={max}
           step={step}
-          value={value}
+          value={numericValue}
           onChange={handleRangeChange}
           disabled={disabled}
           className="silence-control-slider"
@@ -48,15 +49,13 @@ export default function SilenceDurationControl({
           min={min}
           max={max}
           step={step}
-          value={Number(formattedValue)}
+          value={numericValue}
           onChange={handleNumberChange}
           disabled={disabled}
           className="silence-control-number"
         />
       </div>
-      <span className="silence-control-value">
-        {formattedValue}s <span aria-hidden="true">⚙️</span>
-      </span>
+      <span className="silence-control-value">Current: {formattedValue}s</span>
     </div>
   );
 }

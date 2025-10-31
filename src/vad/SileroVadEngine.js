@@ -11,12 +11,11 @@ const DEFAULT_SILENCE_SECONDS = 2;
 const MIN_SILENCE_SECONDS = 0.5;
 const MAX_SILENCE_SECONDS = 5;
 
-const ENGINE_STATES = {
+export const ENGINE_STATES = {
   IDLE: 'IDLE',
   LISTENING: 'LISTENING',
   RECORDING: 'RECORDING',
   SILENCE_DETECTED: 'SILENCE_DETECTED',
-  PLAYING_BACK: 'PLAYING_BACK',
 };
 
 function clamp(value, min, max) {
@@ -62,13 +61,10 @@ export default function createSileroVadEngine(options) {
   const modelPath = config.modelPath || `${process.env.PUBLIC_URL || ''}/silero_vad.onnx`;
   const statusListener =
     typeof config.onStatusChange === 'function' ? config.onStatusChange : () => {};
-  const stateListener = typeof config.onStateChange === 'function' ? config.onStateChange : () => {};
+  const stateListener =
+    typeof config.onStateChange === 'function' ? config.onStateChange : () => {};
   const recordingCompleteListener =
     typeof config.onRecordingComplete === 'function' ? config.onRecordingComplete : () => {};
-  const playbackStartListener =
-    typeof config.onPlaybackStart === 'function' ? config.onPlaybackStart : () => {};
-  const playbackEndListener =
-    typeof config.onPlaybackEnd === 'function' ? config.onPlaybackEnd : () => {};
   const logSilence = config.logSilence !== false;
 
   let silenceDurationSeconds = clamp(
@@ -89,8 +85,7 @@ export default function createSileroVadEngine(options) {
   let pendingCapture = false;
   let active = false;
   let capturing = false;
-  let playbackContext = null;
-  let playbackSource = null;
+  let processingSilence = false;
 
   let contextBuffer = new Float32Array(CONTEXT_SAMPLES);
   let stateBuffer = new Float32Array(STATE_SIZE);
@@ -176,62 +171,24 @@ export default function createSileroVadEngine(options) {
 
   resetInferenceState();
 
-  function stopPlayback() {
-    if (playbackSource) {
-      try {
-        playbackSource.stop();
-      } catch (error) {
-        console.warn('[SileroVAD] Unable to stop playback source', error);
-      }
-      playbackSource.disconnect();
-      playbackSource = null;
+  function finalizeSilenceDetection() {
+    if (processingSilence) {
+      return;
     }
-    if (playbackContext) {
-      playbackContext.close().catch(() => {});
-      playbackContext = null;
-    }
-  }
+    processingSilence = true;
+    active = false;
+    capturing = false;
 
-  function playRecording(floatData) {
-    return new Promise((resolve, reject) => {
-      if (!floatData || floatData.length === 0) {
-        resolve();
-        return;
-      }
+    setEngineState(ENGINE_STATES.SILENCE_DETECTED, 'Silence detected.');
 
-      const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
-      if (!AudioContextCtor) {
-        reject(new Error('Web Audio API not supported'));
-        return;
-      }
+    const recorded = collectRecording();
+    releaseAudioResources();
+    resetInferenceState();
+    clearProcessingQueues();
+    recordingCompleteListener(recorded);
+    resetRecording();
 
-      try {
-        playbackContext = new AudioContextCtor();
-        const audioBuffer = playbackContext.createBuffer(1, floatData.length, TARGET_SAMPLE_RATE);
-        const channel = audioBuffer.getChannelData(0);
-        channel.set(floatData);
-
-        playbackSource = playbackContext.createBufferSource();
-        playbackSource.buffer = audioBuffer;
-        playbackSource.connect(playbackContext.destination);
-
-        playbackSource.onended = () => {
-          stopPlayback();
-          resolve();
-        };
-
-        if (playbackContext.state === 'suspended') {
-          playbackContext
-            .resume()
-            .then(() => playbackSource.start())
-            .catch(reject);
-        } else {
-          playbackSource.start();
-        }
-      } catch (error) {
-        reject(error);
-      }
-    });
+    processingSilence = false;
   }
 
   function clearProcessingQueues() {
@@ -239,49 +196,6 @@ export default function createSileroVadEngine(options) {
     pendingResidual = new Float32Array(0);
     silenceRing.clear();
     speaking = false;
-  }
-
-  function handlePlaybackLoopCompletion() {
-    stopPlayback();
-    playbackEndListener();
-    resetRecording();
-    resetInferenceState();
-    if (disposed || !active) {
-      setEngineState(ENGINE_STATES.IDLE, 'Idle');
-      return;
-    }
-    setEngineState(ENGINE_STATES.LISTENING, 'Preparing microphone...');
-    requestCapture();
-  }
-
-  function handleSilenceDetected() {
-    if (engineState === ENGINE_STATES.PLAYING_BACK || engineState === ENGINE_STATES.SILENCE_DETECTED) {
-      return;
-    }
-    if (logSilence) {
-      console.log(`[SileroVAD] Silence detected after ${silenceDurationSeconds.toFixed(2)}s`);
-    }
-    setEngineState(ENGINE_STATES.SILENCE_DETECTED, 'Silence detected.');
-    clearProcessingQueues();
-    releaseAudioResources();
-
-    const recorded = collectRecording();
-    recordingCompleteListener(recorded);
-
-    if (!recorded || recorded.length === 0) {
-      handlePlaybackLoopCompletion();
-      return;
-    }
-
-    setEngineState(ENGINE_STATES.PLAYING_BACK, 'Playing back...');
-    playbackStartListener();
-
-    playRecording(recorded)
-      .catch((error) => {
-        console.error('[SileroVAD] Playback error', error);
-        setStatus('Playback error');
-      })
-      .finally(handlePlaybackLoopCompletion);
   }
 
   function prepareInput(chunk) {
@@ -309,12 +223,7 @@ export default function createSileroVadEngine(options) {
   }
 
   function processQueue() {
-    if (
-      !sessionReady ||
-      runningInference ||
-      chunkQueue.length === 0 ||
-      engineState === ENGINE_STATES.PLAYING_BACK
-    ) {
+    if (!sessionReady || runningInference || chunkQueue.length === 0 || !active) {
       return;
     }
 
@@ -346,7 +255,7 @@ export default function createSileroVadEngine(options) {
   }
 
   function handleDetection(probability) {
-    if (!active || engineState === ENGINE_STATES.PLAYING_BACK) {
+    if (!active) {
       return;
     }
 
@@ -367,12 +276,15 @@ export default function createSileroVadEngine(options) {
     speaking = false;
 
     if (silenceRing.size() >= silenceFramesRequired && silenceRing.sum() === 0) {
-      handleSilenceDetected();
+      if (logSilence) {
+        console.log(`[SileroVAD] Silence detected after ${silenceDurationSeconds.toFixed(2)}s`);
+      }
+      finalizeSilenceDetection();
     }
   }
 
   function downsampleAndSchedule(inputChunk) {
-    if (!downsampler || engineState === ENGINE_STATES.PLAYING_BACK || !active) {
+    if (!downsampler || !active) {
       return;
     }
     const resampled = downsampler.process(inputChunk);
@@ -419,6 +331,7 @@ export default function createSileroVadEngine(options) {
 
   function releaseAudioResources() {
     capturing = false;
+    pendingCapture = false;
     if (processorNode) {
       processorNode.disconnect();
       processorNode.onaudioprocess = null;
@@ -556,18 +469,20 @@ export default function createSileroVadEngine(options) {
     },
     stop() {
       active = false;
+      processingSilence = false;
       releaseAudioResources();
       clearProcessingQueues();
-      stopPlayback();
       resetRecording();
+      resetInferenceState();
       setEngineState(ENGINE_STATES.IDLE, 'Idle');
     },
     dispose() {
       disposed = true;
       active = false;
+      processingSilence = false;
       releaseAudioResources();
       clearProcessingQueues();
-      stopPlayback();
+      resetRecording();
       disposeSession();
       setEngineState(ENGINE_STATES.IDLE, 'Disposed');
     },
@@ -580,6 +495,9 @@ export default function createSileroVadEngine(options) {
     setSilenceDuration(seconds) {
       updateSilenceDuration(seconds);
       silenceRing.clear();
+    },
+    isActive() {
+      return active;
     },
   };
 }

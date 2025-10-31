@@ -1,38 +1,42 @@
-import { ENGINE_STATES } from '../hooks/useSileroVad';
+import { PIPELINE_STATES } from '../hooks/useSileroVad';
 
 const STATUS_VARIANTS = {
-  [ENGINE_STATES.IDLE]: {
+  [PIPELINE_STATES.IDLE]: {
     label: 'Idle',
     appearance: 'idle',
   },
-  [ENGINE_STATES.LISTENING]: {
+  [PIPELINE_STATES.LISTENING]: {
     label: 'Listening',
     appearance: 'listening',
   },
-  [ENGINE_STATES.RECORDING]: {
+  [PIPELINE_STATES.RECORDING]: {
     label: 'Recording',
     appearance: 'recording',
   },
-  [ENGINE_STATES.SILENCE_DETECTED]: {
+  [PIPELINE_STATES.SILENCE_DETECTED]: {
     label: 'Silence detected',
     appearance: 'silence',
   },
-  [ENGINE_STATES.PLAYING_BACK]: {
-    label: 'Playing back',
+  [PIPELINE_STATES.SENDING_TO_BACKEND]: {
+    label: 'Sending to backend',
+    appearance: 'sending',
+  },
+  [PIPELINE_STATES.PLAYING_AUDIO]: {
+    label: 'Playing audio',
     appearance: 'playback',
   },
 };
 
 function resolveStatusVariant(state, ready, isActive) {
   if (!ready) {
-    return STATUS_VARIANTS[ENGINE_STATES.IDLE];
+    return STATUS_VARIANTS[PIPELINE_STATES.IDLE];
   }
 
-  if (!isActive && state === ENGINE_STATES.IDLE) {
-    return STATUS_VARIANTS[ENGINE_STATES.IDLE];
+  if (!isActive && state === PIPELINE_STATES.IDLE) {
+    return STATUS_VARIANTS[PIPELINE_STATES.IDLE];
   }
 
-  return STATUS_VARIANTS[state] || STATUS_VARIANTS[ENGINE_STATES.LISTENING];
+  return STATUS_VARIANTS[state] || STATUS_VARIANTS[PIPELINE_STATES.LISTENING];
 }
 
 export default function VadStatusIndicator({
