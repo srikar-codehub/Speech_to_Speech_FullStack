@@ -439,10 +439,29 @@ export default function useSileroVad(options = {}) {
           }
         }
 
-        setStatus('Error - Click Start to retry');
-        setPipelineState(PIPELINE_STATES.IDLE);
-        shouldContinueRef.current = false;
-        setIsActive(false);
+        if (shouldContinueRef.current) {
+          addLog('\u{1F504} AUTO-RESTART: Restarting listening after error...', LOG_TYPES.INFO);
+          setPipelineState(PIPELINE_STATES.LISTENING);
+          setStatus('Listening...');
+          if (engineRef.current && ready) {
+            try {
+              engineRef.current.start();
+            } catch (startError) {
+              console.warn('Engine start failed after error', startError);
+              addLog(
+                '\u26A0\uFE0F AUTO-RESTART FAILED: Please click Start to continue.',
+                LOG_TYPES.WARNING
+              );
+              setPipelineState(PIPELINE_STATES.IDLE);
+              setStatus('Idle.');
+              shouldContinueRef.current = false;
+              setIsActive(false);
+            }
+          }
+        } else {
+          setStatus('Idle.');
+          setPipelineState(PIPELINE_STATES.IDLE);
+        }
         return;
       } finally {
         processingRef.current = false;
