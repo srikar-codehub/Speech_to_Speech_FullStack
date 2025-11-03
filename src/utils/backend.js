@@ -74,9 +74,9 @@ async function fetchWithTimeout(url, options, timeoutMs) {
 }
 
 export default async function sendAudioToBackend(audioData, config) {
-  const sourceLanguage = config?.sourceLanguage || 'English';
-  const targetLanguage = config?.targetLanguage || 'Spanish';
-  const neuralVoice = config?.neuralVoice || 'Female Voice 1';
+  const sourceLanguage = config?.sourceLanguage || config?.sourceLocale || 'en-US';
+  const targetLanguage = config?.targetLanguage || config?.targetLocale || 'es-ES';
+  const neuralVoice = config?.neuralVoice || config?.neuralVoiceId || 'es-ES-ElviraNeural';
   const backendUrl = config?.backendUrl || 'http://localhost:7071';
   const showFullRequest = Boolean(config?.showFullRequest);
   const beforeSend =
@@ -89,8 +89,8 @@ export default async function sendAudioToBackend(audioData, config) {
   const { base64, byteLength } = encodeWavToBase64(audioData);
 
   const payload = {
-    source_language: sourceLanguage,
-    target_language: targetLanguage,
+    source_locale: sourceLanguage,
+    target_locale: targetLanguage,
     neural_voice: neuralVoice,
     audio_data: base64,
   };

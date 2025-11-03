@@ -287,23 +287,22 @@ export default function useSileroVad(options = {}) {
         setPipelineState(PIPELINE_STATES.SENDING_TO_BACKEND);
         setStatus('Preparing payload for backend...');
 
-        const backendSourceLanguage =
-          sourceLanguage?.name || DEFAULT_SOURCE_LANGUAGE.name;
-        const backendTargetLanguage =
-          targetLanguage?.name || DEFAULT_TARGET_LANGUAGE.name;
-        const voiceGender =
-          (neuralVoice && neuralVoice.gender) ||
-          (DEFAULT_NEURAL_VOICE && DEFAULT_NEURAL_VOICE.gender) ||
-          'Female';
-        const backendNeuralVoice = `${voiceGender} Voice 1`;
+        const backendSourceLocale =
+          sourceLanguage?.locale || DEFAULT_SOURCE_LANGUAGE.locale;
+        const backendTargetLocale =
+          targetLanguage?.locale || DEFAULT_TARGET_LANGUAGE.locale;
+        const backendNeuralVoice =
+          (neuralVoice && neuralVoice.short_name) ||
+          (DEFAULT_NEURAL_VOICE && DEFAULT_NEURAL_VOICE.short_name) ||
+          '';
         const displayVoiceName = neuralVoice
           ? `${neuralVoice.name || 'Unknown'} - ${neuralVoice.gender || 'Unknown'}`
           : 'None';
         const voiceShortName = neuralVoice?.short_name || 'N/A';
 
         const sendResult = await sendAudioToBackend(audioData, {
-          sourceLanguage: backendSourceLanguage,
-          targetLanguage: backendTargetLanguage,
+          sourceLanguage: backendSourceLocale,
+          targetLanguage: backendTargetLocale,
           neuralVoice: backendNeuralVoice,
           backendUrl,
           showFullRequest,
@@ -323,11 +322,11 @@ export default function useSileroVad(options = {}) {
 
             addLog('\u{1F4CB} JSON GENERATED:', LOG_TYPES.INFO);
             addLog(
-              `Source: ${backendSourceLanguage} (${sourceLanguage?.code || 'n/a'})`,
+              `Source: ${sourceLanguage?.name || 'Unknown'} (${sourceLanguage?.code || 'n/a'}) [${backendSourceLocale}]`,
               LOG_TYPES.INFO
             );
             addLog(
-              `Target: ${backendTargetLanguage} (${targetLanguage?.code || 'n/a'})`,
+              `Target: ${targetLanguage?.name || 'Unknown'} (${targetLanguage?.code || 'n/a'}) [${backendTargetLocale}]`,
               LOG_TYPES.INFO
             );
             addLog(
