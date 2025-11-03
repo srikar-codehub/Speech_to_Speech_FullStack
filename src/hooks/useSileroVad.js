@@ -11,20 +11,48 @@ export const PIPELINE_STATES = {
   PLAYING_AUDIO: 'PLAYING_AUDIO',
 };
 
-export const LANGUAGE_OPTIONS = [
-  'English',
-  'Spanish',
-  'French',
-  'German',
-  'Hindi',
-  'Chinese',
-  'Japanese',
-  'Korean',
-  'Italian',
-  'Portuguese',
-];
+const DEFAULT_SOURCE_LANGUAGE = {
+  code: 'en',
+  name: 'English',
+  nativeName: 'English',
+  locale: 'en-US',
+};
 
-export const VOICE_OPTIONS = ['Female Voice 1', 'Male Voice 1', 'Female Voice 2', 'Male Voice 2'];
+const DEFAULT_TARGET_LANGUAGE = {
+  code: 'es',
+  name: 'Spanish',
+  nativeName: 'Español',
+  locale: 'es-ES',
+};
+
+const DEFAULT_NEURAL_VOICE = {
+  short_name: 'es-ES-ElviraNeural',
+  name: 'Elvira',
+  gender: 'Female',
+};
+
+function normalizeLanguage(language, fallback) {
+  if (language && typeof language === 'object') {
+    return {
+      ...(fallback && typeof fallback === 'object' ? fallback : {}),
+      ...language,
+    };
+  }
+  if (fallback && typeof fallback === 'object') {
+    return { ...fallback };
+  }
+  return {};
+}
+
+function normalizeVoice(voice, fallback) {
+  if (voice && typeof voice === 'object') {
+    return { ...voice };
+  }
+  if (fallback && typeof fallback === 'object') {
+    return { ...fallback };
+  }
+  return null;
+}
 
 const DEFAULT_SILENCE_SECONDS = 2;
 const MIN_SILENCE_SECONDS = 0.5;
@@ -37,7 +65,13 @@ export const LOG_TYPES = {
   WARNING: 'warning',
 };
 
-export default function useSileroVad() {
+export default function useSileroVad(options = {}) {
+  const {
+    initialSourceLanguage = DEFAULT_SOURCE_LANGUAGE,
+    initialTargetLanguage = DEFAULT_TARGET_LANGUAGE,
+    initialNeuralVoice = DEFAULT_NEURAL_VOICE,
+  } = options;
+
   const engineRef = useRef(null);
   const initialSilenceRef = useRef(DEFAULT_SILENCE_SECONDS);
   const handleRecordingRef = useRef(() => {});
@@ -52,9 +86,15 @@ export default function useSileroVad() {
   const [isActive, setIsActive] = useState(false);
   const [lastRecording, setLastRecording] = useState(null);
   const [lastPayload, setLastPayload] = useState(null);
-  const [sourceLanguage, setSourceLanguage] = useState(LANGUAGE_OPTIONS[0]);
-  const [targetLanguage, setTargetLanguage] = useState(LANGUAGE_OPTIONS[1]);
-  const [neuralVoice, setNeuralVoice] = useState(VOICE_OPTIONS[0]);
+  const [sourceLanguage, setSourceLanguage] = useState(() =>
+    normalizeLanguage(initialSourceLanguage, DEFAULT_SOURCE_LANGUAGE)
+  );
+  const [targetLanguage, setTargetLanguage] = useState(() =>
+    normalizeLanguage(initialTargetLanguage, DEFAULT_TARGET_LANGUAGE)
+  );
+  const [neuralVoice, setNeuralVoice] = useState(() =>
+    normalizeVoice(initialNeuralVoice, DEFAULT_NEURAL_VOICE)
+  );
   const [logs, setLogs] = useState([]);
   const [devices, setDevices] = useState([{ deviceId: DEFAULT_DEVICE_ID, label: 'System Default' }]);
   const [selectedDeviceId, setSelectedDeviceId] = useState(DEFAULT_DEVICE_ID);
@@ -247,10 +287,24 @@ export default function useSileroVad() {
         setPipelineState(PIPELINE_STATES.SENDING_TO_BACKEND);
         setStatus('Preparing payload for backend...');
 
+        const backendSourceLanguage =
+          sourceLanguage?.name || DEFAULT_SOURCE_LANGUAGE.name;
+        const backendTargetLanguage =
+          targetLanguage?.name || DEFAULT_TARGET_LANGUAGE.name;
+        const voiceGender =
+          (neuralVoice && neuralVoice.gender) ||
+          (DEFAULT_NEURAL_VOICE && DEFAULT_NEURAL_VOICE.gender) ||
+          'Female';
+        const backendNeuralVoice = `${voiceGender} Voice 1`;
+        const displayVoiceName = neuralVoice
+          ? `${neuralVoice.name || 'Unknown'} - ${neuralVoice.gender || 'Unknown'}`
+          : 'None';
+        const voiceShortName = neuralVoice?.short_name || 'N/A';
+
         const sendResult = await sendAudioToBackend(audioData, {
-          sourceLanguage,
-          targetLanguage,
-          neuralVoice,
+          sourceLanguage: backendSourceLanguage,
+          targetLanguage: backendTargetLanguage,
+          neuralVoice: backendNeuralVoice,
           backendUrl,
           showFullRequest,
           onBeforeSend: ({ payload, endpoint, requestBytes }) => {
@@ -267,6 +321,20 @@ export default function useSileroVad() {
                 : '(no audio data)',
             };
 
+            addLog('\u{1F4CB} JSON GENERATED:', LOG_TYPES.INFO);
+            addLog(
+              `Source: ${backendSourceLanguage} (${sourceLanguage?.code || 'n/a'})`,
+              LOG_TYPES.INFO
+            );
+            addLog(
+              `Target: ${backendTargetLanguage} (${targetLanguage?.code || 'n/a'})`,
+              LOG_TYPES.INFO
+            );
+            addLog(
+              `Voice: ${displayVoiceName} (${voiceShortName})`,
+              LOG_TYPES.INFO
+            );
+            addLog(JSON.stringify(payload, null, 2), LOG_TYPES.INFO);
             addLog(`\u{1F4E4} HTTP REQUEST: Sending to ${endpoint}`, LOG_TYPES.INFO);
             addLog(`\u{1F4CB} REQUEST PAYLOAD:\n${JSON.stringify(payloadPreview, null, 2)}`, LOG_TYPES.INFO);
             addLog('\u23F3 WAITING: Backend processing (STT \u2192 Translate \u2192 TTS)...', LOG_TYPES.INFO);
